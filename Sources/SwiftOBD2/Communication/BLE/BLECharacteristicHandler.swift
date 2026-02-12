@@ -96,7 +96,18 @@ class BLECharacteristicHandler {
         messageProcessor.processReceivedData(data)
     }
 
-    func reset() {
+    func reset(peripheral: CBPeripheral? = nil) {
+        // Unsubscribe from notifications before clearing references
+        // This prevents ghost notifications arriving after disconnect
+        if let peripheral = peripheral {
+            if let readChar = ecuReadCharacteristic, readChar.isNotifying {
+                peripheral.setNotifyValue(false, for: readChar)
+            }
+            if let writeChar = ecuWriteCharacteristic, writeChar != ecuReadCharacteristic, writeChar.isNotifying {
+                peripheral.setNotifyValue(false, for: writeChar)
+            }
+        }
+
         ecuReadCharacteristic = nil
         ecuWriteCharacteristic = nil
     }

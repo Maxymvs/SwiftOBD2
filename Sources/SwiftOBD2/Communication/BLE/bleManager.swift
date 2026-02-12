@@ -68,8 +68,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     var connectionStatePublisher: Published<ConnectionState>.Publisher { $connectionState }
 
-
     public weak var obdDelegate: OBDServiceDelegate?
+
+    // MARK: - Auto-Reconnect Properties
+    var autoReconnectEnabled: Bool = false
+    var lastConnectedPeripheralUUID: UUID?
+    private var reconnectAttempts: Int = 0
+    private let maxReconnectAttempts: Int = 5
+    private var reconnectTask: Task<Void, Never>?
 
     // Focused components
     private var centralManager: CBCentralManager!
@@ -78,10 +84,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     private var peripheralManager: BLEPeripheralManager!
     private var peripheralScanner: BLEPeripheralScanner!
 
+    /// Serializes all sendCommand calls — ELM327 can only handle one command at a time
+    private let commandSemaphore = AsyncSemaphore(value: 1)
+
     private var cancellables = Set<AnyCancellable>()
     
     deinit {
         // Clean up resources
+        reconnectTask?.cancel()
         cancellables.removeAll()
         disconnectPeripheral()
         obdDebug("BLEManager deinitialized", category: .bluetooth)
@@ -162,15 +172,26 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     }
 
     func centralManagerDidPowerOn() {
-        guard let device = peripheralManager.connectedPeripheral else {
-            startScanning(BLEPeripheralScanner.supportedServices)
+        // Already connected peripheral — reconnect
+        if let device = peripheralManager.connectedPeripheral {
+            connect(to: device)
             return
         }
-        connect(to: device)
+
+        // Auto-reconnect to last known peripheral if enabled
+        if autoReconnectEnabled, let uuid = lastConnectedPeripheralUUID,
+           let peripheral = centralManager.retrievePeripherals(withIdentifiers: [uuid]).first {
+            obdInfo("Power on: auto-reconnecting to last peripheral", category: .bluetooth)
+            connect(to: peripheral)
+            return
+        }
+
+        startScanning(BLEPeripheralScanner.supportedServices)
     }
 
     func didDiscover(_: CBCentralManager, peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         peripheralScanner.addDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: rssi)
+        peripheralSubject.send(peripheral)
     }
 
     func connect(to peripheral: CBPeripheral) {
@@ -193,6 +214,8 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     func didConnect(_: CBCentralManager, peripheral: CBPeripheral) {
         obdInfo("Connected to peripheral: \(peripheral.name ?? "Unnamed")", category: .bluetooth)
+        reconnectAttempts = 0 // Reset on successful connection
+        lastConnectedPeripheralUUID = peripheral.identifier
         peripheralManager.setPeripheral(peripheral)
         // Note: connectionState will be set to .connectedToAdapter in peripheralManager delegate
     }
@@ -213,19 +236,50 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     func didDisconnect(_: CBCentralManager, peripheral: CBPeripheral, error: Error?) {
         let peripheralName = peripheral.name ?? "Unnamed"
-        if let error = error {
-            obdWarning("Unexpected disconnection from \(peripheralName): \(error.localizedDescription)", category: .bluetooth)
+        let wasUnexpected = error != nil
+
+        if wasUnexpected {
+            obdWarning("Unexpected disconnection from \(peripheralName): \(error!.localizedDescription)", category: .bluetooth)
         } else {
             obdInfo("Disconnected from peripheral: \(peripheralName)", category: .bluetooth)
         }
-        resetConfigure()
+
+        // Store UUID BEFORE reset clears peripheral reference
+        let peripheralUUID = peripheral.identifier
+        if lastConnectedPeripheralUUID == nil {
+            lastConnectedPeripheralUUID = peripheralUUID
+        }
+
+        // Full reset of all BLE state
+        resetAllState()
+
+        // Auto-reconnect on unexpected disconnect if enabled
+        if wasUnexpected && autoReconnectEnabled && reconnectAttempts < maxReconnectAttempts {
+            obdInfo("Scheduling auto-reconnect attempt \(reconnectAttempts + 1)/\(maxReconnectAttempts)", category: .bluetooth)
+            scheduleAutoReconnect(peripheralUUID: peripheralUUID)
+        } else if reconnectAttempts >= maxReconnectAttempts {
+            obdWarning("Max reconnect attempts reached, giving up", category: .bluetooth)
+            reconnectAttempts = 0
+        }
     }
 
     func willRestoreState(_: CBCentralManager, dict: [String: Any]) {
-        if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], let peripheral = peripherals.first {
-            obdDebug("Restoring peripheral: \(peripherals[0].name ?? "Unnamed")", category: .bluetooth)
-            peripheralManager.setPeripheral(peripheral)
+        if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
+           let peripheral = peripherals.first {
+            obdDebug("Restoring peripheral: \(peripheral.name ?? "Unnamed"), state: \(peripheral.state.rawValue)", category: .bluetooth)
 
+            // Check peripheral state before restoring
+            if peripheral.state == .connected {
+                // Peripheral still connected - set up properly
+                peripheralManager.setPeripheral(peripheral)
+                connectionState = .connectedToAdapter
+                obdInfo("Restored connected peripheral", category: .bluetooth)
+            } else {
+                // Peripheral not connected - clear stale reference
+                obdWarning("Restored peripheral not connected, clearing state", category: .bluetooth)
+                peripheralManager.reset()
+                connectionState = .disconnected
+            }
         }
     }
 
@@ -233,14 +287,49 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         obdError("Unexpected connection event: \(event.rawValue)", category: .bluetooth)
     }
 
+    // MARK: - CommProtocol Scanning & State
+
+    /// Publisher for discovered peripherals during scanning
+    var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> {
+        peripheralSubject.eraseToAnyPublisher()
+    }
+
+    /// Current CBManagerState for BT permission/power checking
+    var bluetoothState: CBManagerState {
+        centralManager.state
+    }
+
+    /// Retrieve a peripheral by UUID from iOS cache (same CBCentralManager that will connect)
+    func retrievePeripheral(uuid: UUID) -> CBPeripheral? {
+        guard centralManager.state == .poweredOn else { return nil }
+        return centralManager.retrievePeripherals(withIdentifiers: [uuid]).first
+    }
+
+    /// Start scanning for peripherals and publish discoveries
+    func startPeripheralScanning() {
+        startScanning(nil)
+    }
+
+    /// Stop peripheral scanning
+    func stopPeripheralScanning() {
+        stopScan()
+    }
+
     // MARK: - Async Methods
 
     func connectAsync(timeout: TimeInterval, peripheral: CBPeripheral? = nil) async throws {
         try await waitForPoweredOn()
 
-        if connectionState.isConnected {
-            obdInfo("Already connected to peripheral", category: .bluetooth)
-            return
+        // ALWAYS disconnect and reset before any new connection attempt
+        // This handles stale state after force quit, timeouts, or partial connections
+        // Never skip cleanup even for the same peripheral - stale BLE state causes
+        // corrupted communication after reconnection
+        if connectionState != .disconnected || peripheralManager.connectedPeripheral != nil {
+            obdInfo("Resetting connection state before new connection", category: .bluetooth)
+            _ = await disconnectPeripheralAsync()
+            resetAllState()
+            // Brief delay for reliable Bluetooth cleanup
+            try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
         }
 
         let targetPeripheral: CBPeripheral
@@ -254,6 +343,9 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         connect(to: targetPeripheral)
 
         try await peripheralManager.waitForCharacteristicsSetup(timeout: timeout)
+
+        // Clear any stale data from connection handshake
+        messageProcessor.reset()
     }
 
     func peripheralManager(_ manager: BLEPeripheralManager, didSetupCharacteristics peripheral: CBPeripheral) {
@@ -301,33 +393,44 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     }
 
 
-    /// Sends a message to the connected peripheral and returns the response.
-    /// - Parameter message: The message to send.
-    /// - Returns: The response from the peripheral.
-    /// - Throws:
-    ///     `BLEManagerError.sendingMessagesInProgress` if a message is already being sent.
-    ///     `BLEManagerError.missingPeripheralOrCharacteristic` if the peripheral or ecu characteristic is missing.
-    ///     `BLEManagerError.incorrectDataConversion` if the data cannot be converted to ASCII.
-    ///     `BLEManagerError.peripheralNotConnected` if the peripheral is not connected.
-    ///     `BLEManagerError.timeout` if the operation times out.
-    ///     `BLEManagerError.unknownError` if an unknown error occurs.
-    func sendCommand(_ command: String, retries _: Int = 3) async throws -> [String] {
-        guard let peripheral = peripheralManager.connectedPeripheral else {
-            obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
-            throw BLEManagerError.missingPeripheralOrCharacteristic
-        }
+    /// Sends a command to the connected peripheral and returns the response.
+    ///
+    /// Serialized by `commandSemaphore` — only one command is in-flight at a time.
+    /// Uses a deterministic 3-step protocol: `beginRequest()` → BLE write → `awaitResponse()`.
+    func sendCommand(_ command: String, retries: Int = 3) async throws -> [String] {
+        let acquired = await commandSemaphore.wait()
+        guard acquired else { throw CancellationError() }
+        defer { commandSemaphore.signal() }
+        try Task.checkCancellation()
 
-        obdDebug("Sending command: \(command)", category: .communication)
-        
-        do {
-            try characteristicHandler.writeCommand(command, to: peripheral)
-            let response = try await messageProcessor.waitForResponse(timeout: BLEConstants.defaultTimeout)
-            obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
-            return response
-        } catch {
-            obdError("Command failed: \(command) - \(error.localizedDescription)", category: .communication)
-            throw error
+        for attempt in 1...retries {
+            // Validate peripheral per attempt (connection may drop between retries)
+            guard let peripheral = peripheralManager.connectedPeripheral else {
+                obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
+                throw BLEManagerError.missingPeripheralOrCharacteristic
+            }
+
+            do {
+                let token = messageProcessor.beginRequest()
+                try characteristicHandler.writeCommand(command, to: peripheral)
+                let response = try await messageProcessor.awaitResponse(for: token, timeout: BLEConstants.defaultTimeout)
+                obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
+                return response
+            } catch {
+                // Non-retryable errors — exit immediately
+                if error is CancellationError { throw error }
+                if let processorError = error as? BLEMessageProcessorError,
+                   processorError == .staleRequestToken { throw error }
+                if attempt == retries {
+                    obdError("Command failed after \(retries) attempts: \(command) - \(error.localizedDescription)", category: .communication)
+                    throw error
+                }
+                obdDebug("Attempt \(attempt)/\(retries) failed for \(command): \(error.localizedDescription), retrying...", category: .communication)
+                messageProcessor.reset()
+                try? await Task.sleep(nanoseconds: UInt64(BLEConstants.retryDelay * 1_000_000_000))
+            }
         }
+        throw BLEManagerError.noData
     }
 
 
@@ -339,16 +442,111 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     private func resetConfigure() {
         characteristicHandler.reset()
-        
+
         let oldState = connectionState
         connectionState = .disconnected
         if oldState != connectionState {
             OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
-            
+
             DispatchQueue.main.async {
                 self.obdDelegate?.connectionStateChanged(state: .disconnected)
             }
         }
+    }
+
+    // MARK: - Auto-Reconnect
+
+    /// Schedule an auto-reconnect with exponential backoff
+    private func scheduleAutoReconnect(peripheralUUID: UUID) {
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            guard let self = self else { return }
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+            let delay = min(pow(2.0, Double(self.reconnectAttempts)), 16.0)
+            self.reconnectAttempts += 1
+            obdInfo("Auto-reconnect: waiting \(delay)s before attempt \(self.reconnectAttempts)", category: .bluetooth)
+
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            guard self.autoReconnectEnabled else {
+                obdInfo("Auto-reconnect disabled during wait, aborting", category: .bluetooth)
+                return
+            }
+
+            // Try to retrieve peripheral from iOS cache
+            if let peripheral = self.centralManager.retrievePeripherals(withIdentifiers: [peripheralUUID]).first {
+                obdInfo("Auto-reconnect: found peripheral in cache, connecting...", category: .bluetooth)
+                self.connect(to: peripheral)
+            } else {
+                obdWarning("Auto-reconnect: peripheral not in cache, starting scan...", category: .bluetooth)
+                self.startScanning(BLEPeripheralScanner.supportedServices)
+            }
+        }
+    }
+
+    // MARK: - Full State Reset
+
+    /// Complete reset of all BLE state for reconnection
+    /// Call this AFTER disconnection is confirmed
+    public func resetAllState() {
+        let oldState = connectionState
+
+        // Reset characteristic handler with notification unsubscription
+        // Pass peripheral so it can unsubscribe from notifications before clearing
+        if let peripheral = peripheralManager.connectedPeripheral {
+            characteristicHandler.reset(peripheral: peripheral)
+        } else {
+            characteristicHandler.reset()
+        }
+
+        // Reset message processor buffer (clears stale data)
+        messageProcessor.reset()
+
+        // Clear discovered peripherals list
+        peripheralScanner.reset()
+
+        // Reset peripheral manager (clears pending continuations and peripheral reference)
+        peripheralManager.reset()
+
+        // Reset connection state with delegate notification
+        connectionState = .disconnected
+
+        if oldState != connectionState {
+            OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
+
+            DispatchQueue.main.async {
+                self.obdDelegate?.connectionStateChanged(state: .disconnected)
+            }
+        }
+
+        obdInfo("BLE state fully reset", category: .bluetooth)
+    }
+
+    /// Disconnect and wait for completion
+    /// - Parameter timeout: Maximum time to wait for disconnect
+    /// - Returns: True if disconnect confirmed, false if timed out
+    @discardableResult
+    func disconnectPeripheralAsync(timeout: TimeInterval = 3.0) async -> Bool {
+        guard let peripheral = peripheralManager.connectedPeripheral else {
+            return true // Already disconnected
+        }
+
+        centralManager.cancelPeripheralConnection(peripheral)
+
+        // Wait for connectionState to become .disconnected
+        let startTime = Date()
+        while connectionState != .disconnected {
+            if Date().timeIntervalSince(startTime) > timeout {
+                obdWarning("Disconnect timed out, forcing state cleanup", category: .bluetooth)
+                // FORCE cleanup on timeout - don't leave in half-connected state
+                peripheralManager.reset()
+                connectionState = .disconnected
+                return false
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        }
+
+        return true
     }
 }
 
@@ -383,7 +581,7 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 }
 
-enum BLEManagerError: Error, CustomStringConvertible {
+enum BLEManagerError: Error, CustomStringConvertible, LocalizedError {
     case missingPeripheralOrCharacteristic
     case unknownCharacteristic
     case scanTimeout
@@ -430,5 +628,9 @@ enum BLEManagerError: Error, CustomStringConvertible {
         case .unauthorized:
             return "Error: App not authorized to use Bluetooth Low Energy"
         }
+    }
+
+    var errorDescription: String? {
+        description
     }
 }

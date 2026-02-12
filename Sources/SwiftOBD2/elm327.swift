@@ -65,6 +65,12 @@ class ELM327 {
         }
     }
 
+    /// Internal accessor for the communication manager (used by OBDService pass-throughs)
+    var commManager: CommProtocol {
+        get { comm }
+        set { comm = newValue }
+    }
+
     private var r100: [String] = []
 
     var connectionState: ConnectionState = .disconnected {
@@ -226,8 +232,12 @@ class ELM327 {
     func adapterInitialization() async throws {
         //        [.ATZ, .ATD, .ATL0, .ATE0, .ATH1, .ATAT1, .ATRV, .ATDPN]
         logger.info("Initializing ELM327 adapter...")
+        // Clear stale protocol/response state from previous connection
+        resetState()
         do {
             _ = try await sendCommand("ATZ") // Reset adapter
+            // ELM327 needs time to complete reset (adapter reboots)
+            try? await Task.sleep(nanoseconds: 500_000_000)
             _ = try await okResponse("ATE0") // Echo off
             _ = try await okResponse("ATL0") // Linefeeds off
             _ = try await okResponse("ATS0") // Spaces off
@@ -247,6 +257,12 @@ class ELM327 {
     func stopConnection() {
         comm.disconnectPeripheral()
         connectionState = .disconnected
+    }
+
+    /// Reset all cached protocol and response state
+    func resetState() {
+        canProtocol = nil
+        r100 = []
     }
 
     // MARK: - Message Sending

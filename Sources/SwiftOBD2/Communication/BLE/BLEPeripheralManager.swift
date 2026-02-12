@@ -18,10 +18,33 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
     weak var delegate: BLEPeripheralManagerDelegate?
     private var connectionCompletion: ((CBPeripheral?, Error?) -> Void)?
+    private var hasResumedConnection = false
+
+    /// Connection generation counter to invalidate stale callbacks from previous connections
+    private var connectionGeneration: Int = 0
 
     init(characteristicHandler: BLECharacteristicHandler) {
         self.characteristicHandler = characteristicHandler
         super.init()
+    }
+
+    /// Reset all state for clean reconnection - clears pending continuations
+    func reset() {
+        // Save pending completion before clearing
+        let completion = connectionCompletion
+        connectionCompletion = nil
+
+        // Clear delegate before clearing peripheral reference
+        connectedPeripheral?.delegate = nil
+        connectedPeripheral = nil
+
+        // Resume with error if completion was pending (prevents continuation leak)
+        // This must happen BEFORE setting hasResumedConnection = true
+        // The closure's guard checks hasResumedConnection == false
+        completion?(nil, BLEManagerError.peripheralNotConnected)
+
+        // Mark as handled for any future callbacks that might arrive
+        hasResumedConnection = true
     }
 
     func setPeripheral(_ peripheral: CBPeripheral?) {
@@ -35,9 +58,27 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     }
 
     func waitForCharacteristicsSetup(timeout: TimeInterval) async throws {
-        try await withTimeout(seconds: timeout) { [self] in
+        // Increment generation to invalidate any stale callbacks from previous connections
+        connectionGeneration += 1
+        let currentGeneration = connectionGeneration
+        hasResumedConnection = false  // Reset flag for new request
+
+        try await withTimeout(seconds: timeout, onTimeout: { [weak self] in
+            // Only handle timeout if this is still the current generation
+            guard self?.connectionGeneration == currentGeneration else { return }
+            let completion = self?.connectionCompletion
+            self?.connectionCompletion = nil
+            // Resume the continuation with timeout error — prevents leak that hangs withThrowingTaskGroup
+            completion?(nil, BLEManagerError.timeout)
+        }) { [self] in
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                self.connectionCompletion = { peripheral, error in
+                self.connectionCompletion = { [weak self] peripheral, error in
+                    // Validate this callback is for the current connection generation
+                    guard self?.connectionGeneration == currentGeneration else { return }
+                    // Guard against double-resume
+                    guard self?.hasResumedConnection == false else { return }
+                    self?.hasResumedConnection = true
+
                     if peripheral != nil {
                         continuation.resume()
                     } else if let error = error {
@@ -51,6 +92,12 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     }
 
     func didDiscoverServices(_ peripheral: CBPeripheral, error: Error?) {
+        // Validate this is our connected peripheral (prevents ghost callbacks from old connections)
+        guard peripheral.identifier == connectedPeripheral?.identifier else {
+            logger.warning("Received services for unknown peripheral \(peripheral.identifier), ignoring")
+            return
+        }
+
         for service in peripheral.services ?? [] {
             logger.info("Discovered service: \(service.uuid.uuidString)")
             characteristicHandler.discoverCharacteristics(for: service, on: peripheral)
@@ -58,9 +105,17 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     }
 
     func didDiscoverCharacteristics(_ peripheral: CBPeripheral, service: CBService, error: Error?) {
+        // Validate this is our connected peripheral (prevents ghost callbacks from old connections)
+        guard peripheral.identifier == connectedPeripheral?.identifier else {
+            logger.warning("Received characteristics for unknown peripheral \(peripheral.identifier), ignoring")
+            return
+        }
+
         if let error = error {
             logger.error("Error discovering characteristics: \(error.localizedDescription)")
+            // NO hasResumedConnection guard here - the closure handles double-resume protection
             connectionCompletion?(nil, error)
+            connectionCompletion = nil
             return
         }
 
@@ -70,6 +125,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         // Check if all required characteristics are set up
         if characteristicHandler.isReady {
+            // NO hasResumedConnection guard here - the closure handles double-resume protection
             connectionCompletion?(peripheral, nil)
             connectionCompletion = nil
 
@@ -78,7 +134,13 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         }
     }
 
-    func didUpdateValue(_: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+    func didUpdateValue(_ peripheral: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+        // Validate this is our connected peripheral (prevents ghost callbacks from old connections)
+        guard peripheral.identifier == connectedPeripheral?.identifier else {
+            logger.warning("Received value update for unknown peripheral \(peripheral.identifier), ignoring")
+            return
+        }
+
         if let error = error {
             logger.error("Error reading characteristic value: \(error.localizedDescription)")
             return

@@ -46,6 +46,14 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     @Published public private(set) var isScanning: Bool = false
     @Published public private(set) var connectedPeripheral: CBPeripheral?
+
+    // MARK: - Connection Metadata Cache
+    /// Cached OBDInfo from last successful connection (survives transient reconnect failures)
+    /// Cleared explicitly by caller on user-initiated disconnect, NOT on stopConnection()
+    @Published public private(set) var latestOBDInfo: OBDInfo?
+    /// Cached peripheral name from last successful connection
+    public private(set) var latestConnectedPeripheralName: String?
+
     @Published public var connectionType: ConnectionType {
         didSet {
             switchConnectionType(connectionType)
@@ -98,23 +106,33 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Parameter preferedProtocol: The optional OBD2 protocol to use (if supported).
     /// - Returns: Information about the connected vehicle (`OBDInfo`).
     /// - Throws: Errors that might occur during the connection process.
-    public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7) async throws -> OBDInfo {
+    public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7, peripheral: CBPeripheral? = nil) async throws -> OBDInfo {
         let startTime = CFAbsoluteTimeGetCurrent()
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
-        
+
         do {
             obdDebug("Connecting to adapter...", category: .connection)
-            try await elm327.connectToAdapter(timeout: timeout)
-            
+            try await elm327.connectToAdapter(timeout: timeout, peripheral: peripheral)
+
             obdDebug("Initializing adapter...", category: .connection)
             try await elm327.adapterInitialization()
-            
+
             obdDebug("Initializing vehicle connection...", category: .connection)
             let vehicleInfo = try await initializeVehicle(preferedProtocol)
 
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
             obdInfo("Successfully connected to vehicle: \(vehicleInfo.vin ?? "Unknown")", category: .connection)
+
+            // Cache connection metadata (overwrite with fresh data)
+            await MainActor.run {
+                self.latestOBDInfo = vehicleInfo
+                // Only overwrite peripheral name when a peripheral was explicitly provided;
+                // a nil peripheral (scan-based connect) should not wipe a previously cached name.
+                if let name = peripheral?.name {
+                    self.latestConnectedPeripheralName = name
+                }
+            }
 
             return vehicleInfo
         } catch {
@@ -135,9 +153,27 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         return obd2info
     }
 
+    /// Clears cached connection metadata synchronously.
+    /// Call from @MainActor contexts only (DiagnosticViewModel, AppViewModel).
+    /// NOT called automatically by stopConnection() to preserve metadata during recovery reconnects.
+    @MainActor
+    public func clearConnectionCache() {
+        latestOBDInfo = nil
+        latestConnectedPeripheralName = nil
+    }
+
     /// Terminates the connection with the OBD2 adapter.
     public func stopConnection() {
         elm327.stopConnection()
+    }
+
+    /// Stop connection and wait for full cleanup
+    /// Use this for reliable reconnection
+    public func stopConnectionAsync() async {
+        elm327.stopConnection()
+        elm327.resetState()
+        // Small delay to allow Bluetooth stack to process disconnect
+        try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
     }
 
     /// Switches the active connection type (between Bluetooth and Wi-Fi).
@@ -159,6 +195,63 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             elm327 = ELM327(comm: MOCKComm())
         }
         elm327.obdDelegate = self
+    }
+
+    // MARK: - Scanning, State & Auto-Reconnect (CommProtocol Pass-throughs)
+
+    /// Current Bluetooth state from the underlying CBCentralManager
+    public var bluetoothState: CBManagerState {
+        elm327.commManager.bluetoothState
+    }
+
+    /// Start scanning for BLE peripherals (uses BLEManager's CBCentralManager)
+    public func startPeripheralScanning() {
+        elm327.commManager.startPeripheralScanning()
+    }
+
+    /// Stop scanning for BLE peripherals
+    public func stopPeripheralScanning() {
+        elm327.commManager.stopPeripheralScanning()
+    }
+
+    /// Retrieve a peripheral by UUID from iOS cache (same CBCentralManager that will connect)
+    public func retrievePeripheral(uuid: UUID) -> CBPeripheral? {
+        elm327.commManager.retrievePeripheral(uuid: uuid)
+    }
+
+    /// Publisher for discovered peripherals during scanning
+    public var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> {
+        elm327.commManager.discoveredPeripheralPublisher
+    }
+
+    /// Enable/disable BLE-level auto-reconnect on unexpected disconnect
+    public var autoReconnectEnabled: Bool {
+        get { elm327.commManager.autoReconnectEnabled }
+        set { elm327.commManager.autoReconnectEnabled = newValue }
+    }
+
+    /// Last connected peripheral UUID for auto-reconnect
+    public var lastConnectedPeripheralUUID: UUID? {
+        get { elm327.commManager.lastConnectedPeripheralUUID }
+        set { elm327.commManager.lastConnectedPeripheralUUID = newValue }
+    }
+
+    // MARK: - Reinitialize Connection (skip BLE connect, run ELM327 init only)
+
+    /// Reinitialize ELM327 after BLE auto-reconnect.
+    /// BLE is already connected — only runs adapter init + vehicle setup.
+    public func reinitializeConnection(preferedProtocol: PROTOCOL? = nil) async throws -> OBDInfo {
+        obdInfo("Reinitializing connection (BLE already connected)...", category: .connection)
+        try await elm327.adapterInitialization()
+        let vehicleInfo = try await initializeVehicle(preferedProtocol)
+
+        // Cache connection metadata (overwrite with fresh data)
+        await MainActor.run {
+            self.latestOBDInfo = vehicleInfo
+            // Peripheral name unchanged on reinit — preserve existing cache
+        }
+
+        return vehicleInfo
     }
 
     // MARK: - Request Handling
@@ -205,10 +298,17 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Parameter command: The OBD2 command to send.
     /// - Returns: measurement result
     /// - Throws: Errors that might occur during the request process.
-    public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
-        let response = try await sendCommandInternal("01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined(), retries: 10)
+    public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit, retries: Int = 3) async throws -> [OBDCommand: MeasurementResult] {
+        let boundedRetries = max(1, retries)
+        let response = try await sendCommandInternal(
+            "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined(),
+            retries: boundedRetries
+        )
 
-        guard let responseData = try elm327.canProtocol?.parse(response).first?.data else { return [:] }
+        guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
+            obdDebug("requestPIDs: parse returned nil (canProtocol=\(elm327.canProtocol != nil ? "set" : "nil"), response=\(response))", category: .communication)
+            return [:]
+        }
 
         var batchedResponse = BatchedResponse(response: responseData, unit)
 
@@ -364,13 +464,30 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
 }
 
-public enum OBDServiceError: Error {
+public enum OBDServiceError: Error, LocalizedError {
     case noAdapterFound
     case notConnectedToVehicle
     case adapterConnectionFailed(underlyingError: Error)
     case scanFailed(underlyingError: Error)
     case clearFailed(underlyingError: Error)
     case commandFailed(command: String, error: Error)
+
+    public var errorDescription: String? {
+        switch self {
+        case .noAdapterFound:
+            return "No OBD adapter found."
+        case .notConnectedToVehicle:
+            return "Not connected to vehicle."
+        case .adapterConnectionFailed(let underlyingError):
+            return "Adapter connection failed: \(underlyingError.localizedDescription)"
+        case .scanFailed(let underlyingError):
+            return "Scan failed: \(underlyingError.localizedDescription)"
+        case .clearFailed(let underlyingError):
+            return "Clear trouble codes failed: \(underlyingError.localizedDescription)"
+        case .commandFailed(let command, let error):
+            return "Command \(command) failed: \(error.localizedDescription)"
+        }
+    }
 }
 
 public struct MeasurementResult: Equatable {

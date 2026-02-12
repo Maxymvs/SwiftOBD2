@@ -32,6 +32,19 @@ class BLEPeripheralScanner: ObservableObject {
     ]
 
     private var foundPeripheralCompletion: ((CBPeripheral?, Error?) -> Void)?
+    private var hasResumedPeripheral = false
+
+    /// Scan generation counter to invalidate stale callbacks from previous scans
+    private var scanGeneration: Int = 0
+
+    /// Reset all discovered peripherals for clean reconnection
+    func reset() {
+        scanGeneration += 1  // Invalidate any pending scan callbacks
+        foundPeripherals.removeAll()
+        foundPeripheralCompletion = nil
+        hasResumedPeripheral = true  // Prevent any pending callbacks from resuming
+        logger.debug("Scanner reset, generation now \(self.scanGeneration)")
+    }
 
     func addDiscoveredPeripheral(_ peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         // Filter out peripherals with invalid RSSI
@@ -45,9 +58,9 @@ class BLEPeripheralScanner: ObservableObject {
             logger.info("Found new peripheral: \(peripheral.name ?? "Unnamed") - RSSI: \(rssi)")
         }
 
-        // Complete waiting continuation if exists
+        // NO hasResumedPeripheral guard here - the closure handles double-resume protection
         foundPeripheralCompletion?(peripheral, nil)
-        foundPeripheralCompletion = nil // Clear after calling
+        foundPeripheralCompletion = nil
     }
 
     func waitForFirstPeripheral(timeout: TimeInterval) async throws -> CBPeripheral {
@@ -56,10 +69,37 @@ class BLEPeripheralScanner: ObservableObject {
             return first
         }
 
+        // Increment generation to invalidate stale callbacks from previous scans
+        scanGeneration += 1
+        let currentGeneration = scanGeneration
+        hasResumedPeripheral = false  // Reset flag for new request
+
+        logger.debug("Starting waitForFirstPeripheral with generation \(currentGeneration)")
+
         // Otherwise wait for discovery
-        return try await withTimeout(seconds: timeout, timeoutError: BLEScannerError.scanTimeout) {
+        return try await withTimeout(seconds: timeout, timeoutError: BLEScannerError.scanTimeout, onTimeout: { [weak self] in
+            guard let self = self else { return }
+
+            // Resume the pending continuation on timeout.
+            // Clearing completion without resuming can leave the continuation suspended indefinitely.
+            let completion = self.foundPeripheralCompletion
+            self.foundPeripheralCompletion = nil
+            completion?(nil, BLEScannerError.scanTimeout)
+            self.hasResumedPeripheral = true
+        }) {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CBPeripheral, Error>) in
-                self.foundPeripheralCompletion = { peripheral, error in
+                self.foundPeripheralCompletion = { [weak self] peripheral, error in
+                    // Validate this callback is for the current scan generation
+                    guard let self = self else { return }
+                    guard self.scanGeneration == currentGeneration else {
+                        self.logger.debug("Ignoring stale scan callback (generation \(currentGeneration) vs current \(self.scanGeneration))")
+                        return
+                    }
+
+                    // Guard against double-resume
+                    guard self.hasResumedPeripheral == false else { return }
+                    self.hasResumedPeripheral = true
+
                     if let peripheral = peripheral {
                         continuation.resume(returning: peripheral)
                     } else if let error = error {

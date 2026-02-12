@@ -5,6 +5,7 @@
 //  Created by kemo konteh on 2/26/24.
 //
 
+import Combine
 import CoreBluetooth
 import Foundation
 import Network
@@ -17,6 +18,40 @@ protocol CommProtocol {
     func scanForPeripherals() async throws
     var connectionStatePublisher: Published<ConnectionState>.Publisher { get }
     var obdDelegate: OBDServiceDelegate? { get set }
+
+    // MARK: - Peripheral Scanning (BLE-specific, no-op for WiFi/Mock)
+    func startPeripheralScanning()
+    func stopPeripheralScanning()
+    var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> { get }
+
+    // MARK: - Bluetooth State
+    var bluetoothState: CBManagerState { get }
+
+    // MARK: - Peripheral Retrieval
+    func retrievePeripheral(uuid: UUID) -> CBPeripheral?
+
+    // MARK: - Auto-Reconnect
+    var autoReconnectEnabled: Bool { get set }
+    var lastConnectedPeripheralUUID: UUID? { get set }
+}
+
+// Default no-op implementations for non-BLE managers
+extension CommProtocol {
+    func startPeripheralScanning() {}
+    func stopPeripheralScanning() {}
+    var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> {
+        Empty<CBPeripheral, Never>().eraseToAnyPublisher()
+    }
+    var bluetoothState: CBManagerState { .unknown }
+    func retrievePeripheral(uuid: UUID) -> CBPeripheral? { nil }
+    var autoReconnectEnabled: Bool {
+        get { false }
+        set { }
+    }
+    var lastConnectedPeripheralUUID: UUID? {
+        get { nil }
+        set { }
+    }
 }
 
 enum CommunicationError: Error {
