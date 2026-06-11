@@ -75,31 +75,33 @@ class BLEMessageProcessor {
     func awaitResponse(for token: RequestToken, timeout: TimeInterval) async throws -> [String] {
         try Task.checkCancellation()
 
-        // Check for early result / validate token
-        lock.lock()
-        guard let req = pendingRequest, req.generation == token.generation else {
-            lock.unlock()
-            throw BLEMessageProcessorError.staleRequestToken
+        // Check for early result / validate token.
+        // Returns the early lines, throws on early error / stale token, or
+        // returns nil when the request is still pending and we must suspend.
+        let earlyLines: [String]? = try lock.withLock {
+            guard let req = pendingRequest, req.generation == token.generation else {
+                throw BLEMessageProcessorError.staleRequestToken
+            }
+
+            switch req.state {
+            case .earlyResult(let lines):
+                pendingRequest?.state = .completed
+                return lines
+
+            case .earlyError(let error):
+                pendingRequest?.state = .completed
+                throw error
+
+            case .waitingForResponse:
+                // Will suspend below
+                return nil
+
+            default:
+                throw BLEMessageProcessorError.staleRequestToken
+            }
         }
-
-        switch req.state {
-        case .earlyResult(let lines):
-            pendingRequest?.state = .completed
-            lock.unlock()
-            return lines
-
-        case .earlyError(let error):
-            pendingRequest?.state = .completed
-            lock.unlock()
-            throw error
-
-        case .waitingForResponse:
-            // Will suspend below
-            lock.unlock()
-
-        default:
-            lock.unlock()
-            throw BLEMessageProcessorError.staleRequestToken
+        if let earlyLines {
+            return earlyLines
         }
 
         // Suspend: wrap in timeout + cancellation handler

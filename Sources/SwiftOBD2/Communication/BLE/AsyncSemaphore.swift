@@ -22,13 +22,16 @@ final class AsyncSemaphore: @unchecked Sendable {
     /// Callers **must** only call `signal()` when this returns `true`.
     func wait() async -> Bool {
         // Fast path: try to decrement under lock without suspending
-        lock.lock()
-        if count > 0 {
-            count -= 1
-            lock.unlock()
+        let acquiredWithoutSuspending = lock.withLock { () -> Bool in
+            if count > 0 {
+                count -= 1
+                return true
+            }
+            return false
+        }
+        if acquiredWithoutSuspending {
             return true
         }
-        lock.unlock()
 
         // Slow path: suspend until a permit is available or cancellation
         let waiterId = UUID()

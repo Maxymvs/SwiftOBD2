@@ -47,12 +47,12 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         hasResumedConnection = true
     }
 
-    func setPeripheral(_ peripheral: CBPeripheral?) {
+    func setPeripheral(_ peripheral: CBPeripheral?, discoverServices: Bool = true) {
         connectedPeripheral?.delegate = nil
         connectedPeripheral = peripheral
         connectedPeripheral?.delegate = self
 
-        if let peripheral = peripheral {
+        if discoverServices, let peripheral = peripheral, peripheral.state == .connected {
             peripheral.discoverServices(BLEPeripheralScanner.supportedServices)
         }
     }
