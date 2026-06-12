@@ -33,6 +33,11 @@ protocol CommProtocol {
     // MARK: - Auto-Reconnect
     var autoReconnectEnabled: Bool { get set }
     var lastConnectedPeripheralUUID: UUID? { get set }
+
+    /// Leave an OS-level pending connection to the saved adapter (BLE only).
+    /// Returns true if a connection is now pending or already established.
+    @discardableResult
+    func armStandingReconnect() -> Bool
 }
 
 // Default no-op implementations for non-BLE managers
@@ -52,6 +57,8 @@ extension CommProtocol {
         get { nil }
         set { }
     }
+    @discardableResult
+    func armStandingReconnect() -> Bool { false }
 }
 
 enum CommunicationError: Error {

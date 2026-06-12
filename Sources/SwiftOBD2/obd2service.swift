@@ -236,6 +236,15 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         set { elm327.commManager.lastConnectedPeripheralUUID = newValue }
     }
 
+    /// Leave an OS-level pending BLE connection to the saved adapter, with no
+    /// app-side timeout. iOS completes it whenever the adapter powers on,
+    /// relaunching the app via CoreBluetooth state restoration if needed.
+    /// Requires `autoReconnectEnabled` and a saved peripheral UUID.
+    @discardableResult
+    public func armStandingReconnect() -> Bool {
+        elm327.commManager.armStandingReconnect()
+    }
+
     // MARK: - Reinitialize Connection (skip BLE connect, run ELM327 init only)
 
     /// Reinitialize ELM327 after BLE auto-reconnect.

@@ -93,7 +93,7 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
             },
             operation: {
                 // Main connection task
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                try await withCheckedThrowingContinuation { [self] (continuation: CheckedContinuation<Void, Error>) in
                     var hasResumed = false
 
                     self.connectionCompletion = { [weak self] connectedPeripheral, error in

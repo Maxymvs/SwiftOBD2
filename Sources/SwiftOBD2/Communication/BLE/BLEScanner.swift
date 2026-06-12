@@ -87,7 +87,7 @@ class BLEPeripheralScanner: ObservableObject {
             completion?(nil, BLEScannerError.scanTimeout)
             self.hasResumedPeripheral = true
         }) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CBPeripheral, Error>) in
+            try await withCheckedThrowingContinuation { [self] (continuation: CheckedContinuation<CBPeripheral, Error>) in
                 self.foundPeripheralCompletion = { [weak self] peripheral, error in
                     // Validate this callback is for the current scan generation
                     guard let self = self else { return }
