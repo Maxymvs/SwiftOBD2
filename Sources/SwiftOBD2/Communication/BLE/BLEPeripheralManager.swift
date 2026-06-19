@@ -23,28 +23,31 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     /// Connection generation counter to invalidate stale callbacks from previous connections
     private var connectionGeneration: Int = 0
 
+    /// Guards the single-resume bookkeeping (`connectionCompletion`,
+    /// `hasResumedConnection`, `connectionGeneration`) so the setup continuation
+    /// is resumed exactly once, even though the characteristics callback, the
+    /// timeout, and cancellation can arrive on different threads.
+    private let resumeLock = NSLock()
+
+    /// Holds the per-wait timeout task so a normal completion can cancel it.
+    private final class TimeoutTaskBox: @unchecked Sendable {
+        var value: Task<Void, Never>?
+    }
+
     init(characteristicHandler: BLECharacteristicHandler) {
         self.characteristicHandler = characteristicHandler
         super.init()
     }
 
-    /// Reset all state for clean reconnection - clears pending continuations
+    /// Reset all state for clean reconnection - resumes any pending continuation.
     func reset() {
-        // Save pending completion before clearing
-        let completion = connectionCompletion
-        connectionCompletion = nil
-
-        // Clear delegate before clearing peripheral reference
+        // Clear delegate before clearing peripheral reference.
         connectedPeripheral?.delegate = nil
         connectedPeripheral = nil
 
-        // Resume with error if completion was pending (prevents continuation leak)
-        // This must happen BEFORE setting hasResumedConnection = true
-        // The closure's guard checks hasResumedConnection == false
-        completion?(nil, BLEManagerError.peripheralNotConnected)
-
-        // Mark as handled for any future callbacks that might arrive
-        hasResumedConnection = true
+        // Resume any pending setup wait through the single, lock-guarded sink so
+        // its continuation can't leak. No-op if nothing is waiting.
+        fireConnectionCompletion(peripheral: nil, error: BLEManagerError.peripheralNotConnected)
     }
 
     func setPeripheral(_ peripheral: CBPeripheral?, discoverServices: Bool = true) {
@@ -58,27 +61,54 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     }
 
     func waitForCharacteristicsSetup(timeout: TimeInterval) async throws {
-        // Increment generation to invalidate any stale callbacks from previous connections
-        connectionGeneration += 1
-        let currentGeneration = connectionGeneration
-        hasResumedConnection = false  // Reset flag for new request
+        // If a previous wait is still in flight (e.g. overlapping reconnect
+        // attempts), resume it before we take over the single completion slot —
+        // otherwise its continuation would be orphaned and leak.
+        fireConnectionCompletion(peripheral: nil, error: BLEManagerError.peripheralNotConnected)
 
-        try await withTimeout(seconds: timeout, onTimeout: { [weak self] in
-            // Only handle timeout if this is still the current generation
-            guard self?.connectionGeneration == currentGeneration else { return }
-            let completion = self?.connectionCompletion
-            self?.connectionCompletion = nil
-            // Resume the continuation with timeout error — prevents leak that hangs withThrowingTaskGroup
-            completion?(nil, BLEManagerError.timeout)
-        }) { [self] in
+        // Start a new generation so stale callbacks are ignored, and reset the
+        // single-resume flag — all under the lock. Scoped `withLock` keeps this
+        // safe to call from this async context.
+        let currentGeneration = resumeLock.withLock { () -> Int in
+            connectionGeneration += 1
+            hasResumedConnection = false
+            return connectionGeneration
+        }
+
+        // Owns this wait's timeout task so a normal completion can cancel it.
+        let timeoutBox = TimeoutTaskBox()
+
+        try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                self.connectionCompletion = { [weak self] peripheral, error in
-                    // Validate this callback is for the current connection generation
-                    guard self?.connectionGeneration == currentGeneration else { return }
-                    // Guard against double-resume
-                    guard self?.hasResumedConnection == false else { return }
-                    self?.hasResumedConnection = true
+                resumeLock.lock()
 
+                // Caller was cancelled before we could register — resume now.
+                if Task.isCancelled {
+                    hasResumedConnection = true
+                    resumeLock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+
+                // The single resume sink. Whichever of {characteristics ready,
+                // discovery error, timeout, cancellation, reset, supersede} fires
+                // first wins; the rest are no-ops via the generation +
+                // hasResumedConnection guard. This guarantees exactly-once resume,
+                // so the continuation can never leak.
+                connectionCompletion = { [weak self] peripheral, error in
+                    guard let self else { return }
+                    self.resumeLock.lock()
+                    guard self.connectionGeneration == currentGeneration,
+                          self.hasResumedConnection == false else {
+                        self.resumeLock.unlock()
+                        return
+                    }
+                    self.hasResumedConnection = true
+                    self.connectionCompletion = nil
+                    self.resumeLock.unlock()
+
+                    // Stop the timeout; resume exactly once, outside the lock.
+                    timeoutBox.value?.cancel()
                     if peripheral != nil {
                         continuation.resume()
                     } else if let error = error {
@@ -87,8 +117,33 @@ class BLEPeripheralManager: NSObject, ObservableObject {
                         continuation.resume(throwing: BLEManagerError.unknownError)
                     }
                 }
+                resumeLock.unlock()
+
+                // Self-contained timeout that drives the same single sink.
+                if timeout > 0 {
+                    timeoutBox.value = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                        guard !Task.isCancelled else { return }
+                        self?.fireConnectionCompletion(peripheral: nil, error: BLEManagerError.timeout)
+                    }
+                }
             }
+        } onCancel: {
+            // Caller cancelled the await — unblock through the same single sink.
+            fireConnectionCompletion(peripheral: nil, error: CancellationError())
+            timeoutBox.value?.cancel()
         }
+    }
+
+    /// Reads the pending completion under the lock and invokes it outside the
+    /// lock (to avoid resuming while holding it). The stored closure performs the
+    /// exactly-once / correct-generation guard, so this is safe to call from any
+    /// thread, any number of times.
+    private func fireConnectionCompletion(peripheral: CBPeripheral?, error: Error?) {
+        resumeLock.lock()
+        let completion = connectionCompletion
+        resumeLock.unlock()
+        completion?(peripheral, error)
     }
 
     func didDiscoverServices(_ peripheral: CBPeripheral, error: Error?) {
@@ -113,9 +168,8 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         if let error = error {
             logger.error("Error discovering characteristics: \(error.localizedDescription)")
-            // NO hasResumedConnection guard here - the closure handles double-resume protection
-            connectionCompletion?(nil, error)
-            connectionCompletion = nil
+            // Routed through the lock-guarded sink, which handles exactly-once resume.
+            fireConnectionCompletion(peripheral: nil, error: error)
             return
         }
 
@@ -125,9 +179,8 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         // Check if all required characteristics are set up
         if characteristicHandler.isReady {
-            // NO hasResumedConnection guard here - the closure handles double-resume protection
-            connectionCompletion?(peripheral, nil)
-            connectionCompletion = nil
+            // Routed through the lock-guarded sink, which handles exactly-once resume.
+            fireConnectionCompletion(peripheral: peripheral, error: nil)
 
             // Notify delegate
             delegate?.peripheralManager(self, didSetupCharacteristics: peripheral)
