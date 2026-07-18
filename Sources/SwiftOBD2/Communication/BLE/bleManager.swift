@@ -57,6 +57,12 @@ enum BLEConstants {
 }
 
 class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
+    enum DisconnectRecoveryAction: Equatable {
+        case none
+        case retry
+        case armStandingReconnect
+    }
+
     private let peripheralSubject = PassthroughSubject<CBPeripheral, Never>()
     // Replaced with centralized logging - see connectionStateDidChange for usage
 
@@ -77,6 +83,9 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     private let maxReconnectAttempts: Int = 5
     private var reconnectTask: Task<Void, Never>?
     private var connectTimeoutTask: Task<Void, Never>?
+    /// Distinguishes a local recovery/user cancellation from the adapter
+    /// disappearing cleanly when the ignition powers it down.
+    private var disconnectWasRequested = false
 
     // Focused components
     private var centralManager: CBCentralManager!
@@ -150,6 +159,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             resetAllState()
             return
         }
+        disconnectWasRequested = true
         centralManager.cancelPeripheralConnection(peripheral)
     }
 
@@ -161,6 +171,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             centralManagerDidPowerOn()
         case .poweredOff:
             obdWarning("Bluetooth powered off", category: .bluetooth)
+            disconnectWasRequested = false
             peripheralManager.connectedPeripheral = nil
             let oldState = connectionState
             connectionState = .disconnected
@@ -240,6 +251,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     func didConnect(_: CBCentralManager, peripheral: CBPeripheral) {
         obdInfo("Connected to peripheral: \(peripheral.name ?? "Unnamed")", category: .bluetooth)
+        disconnectWasRequested = false
         cancelConnectTimeout()
         reconnectAttempts = 0 // Reset on successful connection
         lastConnectedPeripheralUUID = peripheral.identifier
@@ -265,6 +277,8 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     func didDisconnect(_: CBCentralManager, peripheral: CBPeripheral, error: Error?) {
         let peripheralName = peripheral.name ?? "Unnamed"
         let wasUnexpected = error != nil
+        let wasRequested = disconnectWasRequested
+        disconnectWasRequested = false
         cancelConnectTimeout()
 
         if wasUnexpected {
@@ -282,15 +296,48 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         // Full reset of all BLE state
         resetAllState()
 
-        // Auto-reconnect on unexpected disconnect if enabled
-        if wasUnexpected && autoReconnectEnabled && reconnectAttempts < maxReconnectAttempts {
+        switch disconnectRecoveryAction(hadError: wasUnexpected, wasRequested: wasRequested) {
+        case .none:
+            break
+        case .retry:
             obdInfo("Scheduling auto-reconnect attempt \(reconnectAttempts + 1)/\(maxReconnectAttempts)", category: .bluetooth)
             scheduleAutoReconnect(peripheralUUID: peripheralUUID)
-        } else if reconnectAttempts >= maxReconnectAttempts {
-            obdWarning("Max reconnect attempts reached, falling back to standing reconnect", category: .bluetooth)
+        case .armStandingReconnect:
+            if wasUnexpected {
+                obdWarning("Max reconnect attempts reached, falling back to standing reconnect", category: .bluetooth)
+            } else {
+                obdInfo("Adapter powered off cleanly, arming standing reconnect for the next ignition", category: .bluetooth)
+            }
             reconnectAttempts = 0
             armStandingReconnect()
         }
+    }
+
+    func disconnectRecoveryAction(
+        hadError: Bool,
+        wasRequested: Bool
+    ) -> DisconnectRecoveryAction {
+        Self.disconnectRecoveryAction(
+            hadError: hadError,
+            wasRequested: wasRequested,
+            autoReconnectEnabled: autoReconnectEnabled,
+            reconnectAttempts: reconnectAttempts,
+            maxReconnectAttempts: maxReconnectAttempts
+        )
+    }
+
+    static func disconnectRecoveryAction(
+        hadError: Bool,
+        wasRequested: Bool,
+        autoReconnectEnabled: Bool,
+        reconnectAttempts: Int,
+        maxReconnectAttempts: Int
+    ) -> DisconnectRecoveryAction {
+        guard !wasRequested, autoReconnectEnabled else { return .none }
+        if hadError && reconnectAttempts < maxReconnectAttempts {
+            return .retry
+        }
+        return .armStandingReconnect
     }
 
     /// Leave an OS-level pending connection to the saved adapter, with no
@@ -628,6 +675,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             obdWarning("Connect attempt timed out for peripheral \(peripheral.name ?? peripheral.identifier.uuidString), forcing cleanup", category: .bluetooth)
 
             if self.centralManager.state == .poweredOn {
+                self.disconnectWasRequested = true
                 self.centralManager.cancelPeripheralConnection(peripheral)
             } else {
                 obdWarning("Bluetooth not powered on while timing out connect attempt", category: .bluetooth)
@@ -656,6 +704,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             return false
         }
 
+        disconnectWasRequested = true
         centralManager.cancelPeripheralConnection(peripheral)
 
         // Wait for connectionState to become .disconnected
@@ -666,6 +715,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 // FORCE cleanup on timeout - don't leave in half-connected state
                 peripheralManager.reset()
                 connectionState = .disconnected
+                disconnectWasRequested = false
                 return false
             }
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms

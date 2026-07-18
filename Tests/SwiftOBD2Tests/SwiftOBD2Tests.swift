@@ -2,11 +2,72 @@
 import XCTest
 
 final class SwiftOBD2Tests: XCTestCase {
-    func testExample() throws {
-        // XCTest Documentation
-        // https://developer.apple.com/documentation/xctest
+    func testCleanAdapterPowerOffArmsStandingReconnect() {
+        XCTAssertEqual(
+            BLEManager.disconnectRecoveryAction(
+                hadError: false,
+                wasRequested: false,
+                autoReconnectEnabled: true,
+                reconnectAttempts: 0,
+                maxReconnectAttempts: 5
+            ),
+            .armStandingReconnect
+        )
+    }
 
-        // Defining Test Cases and Test Methods
-        // https://developer.apple.com/documentation/xctest/defining_test_cases_and_test_methods
+    func testRequestedDisconnectDoesNotReconnectEvenWhenEnabled() {
+        for hadError in [false, true] {
+            XCTAssertEqual(
+                BLEManager.disconnectRecoveryAction(
+                    hadError: hadError,
+                    wasRequested: true,
+                    autoReconnectEnabled: true,
+                    reconnectAttempts: 0,
+                    maxReconnectAttempts: 5
+                ),
+                .none
+            )
+        }
+    }
+
+    func testReconnectDisabledDoesNotRecoverRemoteDisconnect() {
+        for hadError in [false, true] {
+            XCTAssertEqual(
+                BLEManager.disconnectRecoveryAction(
+                    hadError: hadError,
+                    wasRequested: false,
+                    autoReconnectEnabled: false,
+                    reconnectAttempts: 5,
+                    maxReconnectAttempts: 5
+                ),
+                .none
+            )
+        }
+    }
+
+    func testUnexpectedDisconnectRetriesBeforeStandingReconnect() {
+        XCTAssertEqual(
+            BLEManager.disconnectRecoveryAction(
+                hadError: true,
+                wasRequested: false,
+                autoReconnectEnabled: true,
+                reconnectAttempts: 0,
+                maxReconnectAttempts: 5
+            ),
+            .retry
+        )
+    }
+
+    func testUnexpectedDisconnectFallsBackAfterRetryBudget() {
+        XCTAssertEqual(
+            BLEManager.disconnectRecoveryAction(
+                hadError: true,
+                wasRequested: false,
+                autoReconnectEnabled: true,
+                reconnectAttempts: 5,
+                maxReconnectAttempts: 5
+            ),
+            .armStandingReconnect
+        )
     }
 }
