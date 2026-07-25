@@ -16,7 +16,7 @@ public enum MeasurementUnit: String, Codable {
     }
 }
 
-public struct Status: Codable, Hashable {
+public struct Status: Codable, Hashable, Sendable {
     var MIL: Bool = false
     public var dtcCount: UInt8 = 0
     var ignitionType: String = ""
@@ -26,7 +26,7 @@ public struct Status: Codable, Hashable {
     var componentMonitoring = StatusTest()
 }
 
-struct StatusTest: Codable, Hashable {
+struct StatusTest: Codable, Hashable, Sendable {
     var name: String = ""
     var supported: Bool = false
     var ready: Bool = false
