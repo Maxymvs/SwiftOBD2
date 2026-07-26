@@ -352,9 +352,30 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         await elm327.getSupportedPIDs()
     }
 
+    /// Scans for trouble codes and returns a per-responder report.
+    ///
+    /// Only a verified positive response ever reads as clean: silence, a negative response,
+    /// damage and recoverable transport failures are all distinct outcomes in the report, and
+    /// every claim is scoped to the profile that was requested.
+    ///
+    /// - Parameter profile: Which services to request. Only ``DTCScanProfile/storedOnly`` is
+    ///   implemented today.
+    /// - Returns: The scan report. `statusRead` is `.notAttempted` — the caller still reads
+    ///   `0101` itself.
+    /// - Throws: Only ``DTCScanError`` — `.profileUnsupported` (raised before any I/O),
+    ///   `.cancelled`/`.connectionLost` carrying the evidence completed so far. Raw transport
+    ///   errors never escape.
+    public func scanForTroubleCodes(profile: DTCScanProfile) async throws -> DTCScanReport {
+        try await elm327.scanForTroubleCodes(profile: profile)
+    }
+
     ///  Scans for trouble codes and returns the result.
     ///  - Returns: The trouble codes found on the vehicle.
     ///  - Throws: Errors that might occur during the request process.
+    ///
+    ///  Superseded by ``scanForTroubleCodes(profile:)``: a dictionary cannot carry per-responder
+    ///  outcomes, so this projection throws for every non-positive result — an empty dictionary
+    ///  means *verified clean*.
     public func scanForTroubleCodes() async throws -> [ECUID: [TroubleCode]] {
         do {
             return try await elm327.scanForTroubleCodes()

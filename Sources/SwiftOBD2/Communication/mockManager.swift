@@ -146,22 +146,17 @@ class MOCKComm: CommProtocol {
         } else if command == "03" {
             // 03 is a request for DTCs
             let dtcs = ["P0104", "U0207"]
-            var response = ""
-            // convert to hex
-            for dtc in dtcs {
-                var hexString = String(dtc.suffix(4))
-                // 2 by 2
-                hexString = hexString.chunked(by: 2).joined(separator: " ")
-                response +=  hexString
-                obdDebug("Generated DTC hex: \(hexString)", category: .communication)
-            }
+            // Two bytes per code, behind the `43` mode byte and the CAN count byte — the ISO-TP
+            // declared length must cover exactly those bytes, or the response is malformed.
+            let codeBytes = dtcs.flatMap { String($0.suffix(4)).chunked(by: 2) }
+            obdDebug("Generated DTC hex: \(codeBytes.joined(separator: " "))", category: .communication)
             if ecuSettings.headerOn {
                 header = "7E8"
             }
-            let mode = "43"
-            response = mode + " " + response
-            let length = String(format: "%02X", response.count / 3 + 1)
-            response = header + " " + length + " " + response
+            let payload = ["43", String(format: "%02X", dtcs.count)] + codeBytes
+            var response = ([header] + [String(format: "%02X", payload.count)] + payload)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
             while response.count < 26 {
                 response.append(" 00")
             }

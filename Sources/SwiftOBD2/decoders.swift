@@ -16,17 +16,19 @@ public enum MeasurementUnit: String, Codable {
     }
 }
 
-public struct Status: Codable, Hashable {
-    var MIL: Bool = false
+public struct Status: Codable, Hashable, Sendable {
+    /// Whether the malfunction indicator lamp (check-engine light) is commanded on.
+    public var MIL: Bool = false
     public var dtcCount: UInt8 = 0
-    var ignitionType: String = ""
+    /// `"Spark"` or `"Compression"`.
+    public var ignitionType: String = ""
 
     var misfireMonitoring = StatusTest()
     var fuelSystemMonitoring = StatusTest()
     var componentMonitoring = StatusTest()
 }
 
-struct StatusTest: Codable, Hashable {
+struct StatusTest: Codable, Hashable, Sendable {
     var name: String = ""
     var supported: Bool = false
     var ready: Bool = false

@@ -63,6 +63,9 @@ extension CommProtocol {
 
 enum CommunicationError: Error {
     case invalidData
+    /// The adapter answered `NO DATA` — silence from the vehicle, not garbled bytes or a dead
+    /// socket. Parity with `BLEManagerError.noData`, so a caller can tell the two apart.
+    case noData
     case errorOccurred(Error)
 }
 
@@ -115,12 +118,19 @@ class WifiManager: CommProtocol {
     }
 
     private func sendCommandInternal(data: Data, retries: Int) async throws -> [String] {
+        var sawNoData = false
         for attempt in 1 ... retries {
             do {
                 let response = try await sendAndReceiveData(data)
-                if let lines = processResponse(response) {
+                switch processResponse(response) {
+                case let .lines(lines):
                     return lines
-                } else if attempt < retries {
+                case .noData:
+                    sawNoData = true
+                case .empty:
+                    break
+                }
+                if attempt < retries {
                     logger.info("No data received, retrying attempt \(attempt + 1) of \(retries)...")
                     try await Task.sleep(nanoseconds: 100_000_000) // 0.5 seconds delay
                 }
@@ -131,7 +141,9 @@ class WifiManager: CommProtocol {
                 logger.warning("Attempt \(attempt) failed, retrying: \(error.localizedDescription)")
             }
         }
-        throw CommunicationError.invalidData
+        // A `NO DATA` line is the vehicle answering with nothing; anything else that got here is
+        // unusable output. Keeping them distinct lets the DTC layer avoid calling garbage silence.
+        throw sawNoData ? CommunicationError.noData : CommunicationError.invalidData
     }
 
     private func sendAndReceiveData(_ data: Data) async throws -> String {
@@ -167,13 +179,21 @@ class WifiManager: CommProtocol {
         }
     }
 
-    private func processResponse(_ response: String) -> [String]? {
+    /// What one buffered read amounted to. `noData` and `empty` were both `nil` before; they are
+    /// separated so the thrown error can say which happened.
+    private enum ProcessedResponse {
+        case lines([String])
+        case noData
+        case empty
+    }
+
+    private func processResponse(_ response: String) -> ProcessedResponse {
         logger.info("Processing response: \(response)")
         var lines = response.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
         guard !lines.isEmpty else {
             logger.warning("Empty response lines")
-            return nil
+            return .empty
         }
 
         if lines.last?.contains(">") == true {
@@ -181,10 +201,10 @@ class WifiManager: CommProtocol {
         }
 
         if lines.first?.lowercased() == "no data" {
-            return nil
+            return .noData
         }
 
-        return lines
+        return .lines(lines)
     }
 
     func disconnectPeripheral() {
