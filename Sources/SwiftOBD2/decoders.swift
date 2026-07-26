@@ -17,9 +17,11 @@ public enum MeasurementUnit: String, Codable {
 }
 
 public struct Status: Codable, Hashable, Sendable {
-    var MIL: Bool = false
+    /// Whether the malfunction indicator lamp (check-engine light) is commanded on.
+    public var MIL: Bool = false
     public var dtcCount: UInt8 = 0
-    var ignitionType: String = ""
+    /// `"Spark"` or `"Compression"`.
+    public var ignitionType: String = ""
 
     var misfireMonitoring = StatusTest()
     var fuelSystemMonitoring = StatusTest()

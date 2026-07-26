@@ -292,32 +292,15 @@ class ELM327 {
         return statusCommand.properties.decode(data: statusData)
     }
 
+    /// Deprecated dictionary scan, reimplemented as a thin wrapper over the report pipeline
+    /// (`DTCScanRequest.swift`) so there is exactly one Mode 03 parse path.
+    ///
+    /// Returns the merged stored codes only when every responder answered positively, and throws
+    /// otherwise — silence, refusal, damage and transport trouble all used to decode as an empty
+    /// *success*. An empty dictionary now means verified clean.
     func scanForTroubleCodes() async throws -> [ECUID: [TroubleCode]] {
-        var dtcs: [ECUID: [TroubleCode]] = [:]
-        logger.info("Scanning for trouble codes")
-        let dtcCommand = OBDCommand.Mode3.GET_DTC
-        let dtcResponse = try await sendCommand(dtcCommand.properties.command)
-
-        guard let messages = try canProtocol?.parse(dtcResponse) else {
-            return [:]
-        }
-        for message in messages {
-            guard let dtcData = message.data else {
-                continue
-            }
-            let decodedResult = dtcCommand.properties.decode(data: dtcData)
-
-            let ecuId = message.ecu
-            switch decodedResult {
-            case let .success(result):
-                dtcs[ecuId] = result.troubleCode
-
-            case let .failure(error):
-                logger.error("Failed to decode DTC: \(error)")
-            }
-        }
-
-        return dtcs
+        let report = try await scanForTroubleCodes(profile: .storedOnly)
+        return try report.legacyStoredCodeDictionary()
     }
 
     func clearTroubleCodes() async throws {
