@@ -116,6 +116,26 @@ public enum PROTOCOL: String, Codable, CaseIterable {
     ]
 }
 
+extension PROTOCOL {
+    /// The parser implementation for this protocol.
+    ///
+    /// Throws for the protocols that have **no** implementation — the user-configurable CAN
+    /// protocols `B`/`C` and `NONE`. Previously the map lookup returned a silent `nil`, so an
+    /// unmapped protocol left `canProtocol == nil`, every parse returned no messages, and the
+    /// failure surfaced far downstream as an "invalid response to 0100" (or an empty PID
+    /// dictionary). An unsupported protocol must fail loudly at setup instead.
+    func parserImplementation() throws -> CANProtocol {
+        guard let implementation = protocols[self] else {
+            obdError(
+                "No parser implementation for protocol \(description) — unsupported by this library",
+                category: .parsing
+            )
+            throw ELM327Error.invalidProtocol
+        }
+        return implementation
+    }
+}
+
 // dictionary of all the protocols
 let protocols: [PROTOCOL: CANProtocol] = [
     .protocol1: SAE_J1850_PWM(),

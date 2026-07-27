@@ -97,20 +97,17 @@ final class DTCScanPhase1Tests: XCTestCase {
         XCTAssertFalse(report.isCoverageComplete)
     }
 
-    func testBusyNegativeResponseIsRecordedWithoutAnyRetry() async throws {
-        let comm = ScriptedComm(responses: ["03": ["7E8 03 7F 03 21"]])
-        let sut = makeELM327(comm: comm)
+    /// A busy `0x21` is preserved as evidence by the parser. Its *disposition* (a bounded
+    /// re-send, then the last NRC) is Phase 3 behaviour — see
+    /// `DTCScanPhase3Tests.testBusyNegativeResponseIsResentUpToTheCap`.
+    func testBusyNegativeResponseIsRecordedAsEvidence() throws {
+        let result = parseCAN(["7E8 03 7F 03 21"])
 
-        let report = try await sut.scanForTroubleCodes(profile: .storedOnly)
-
-        let result = try XCTUnwrap(report.services[.stored])
         XCTAssertEqual(
             try outcome(result, engine),
             .negativeResponse(NegativeResponseCode(rawValue: 0x21))
         )
-        // No NRC-driven retry or wait exists until Phase 3.
-        XCTAssertEqual(comm.sentCommands, ["03"])
-        XCTAssertFalse(report.isCleanForProfile)
+        XCTAssertFalse(DTCScanReport.storedOnly(result).isCleanForProfile)
     }
 
     /// A `7F` whose echoed service byte is not the in-flight request is noise, not evidence —
@@ -365,14 +362,15 @@ final class DTCScanPhase1Tests: XCTestCase {
         XCTAssertEqual(DTCProtocolFamily(elmID: "8"), .can11)
         XCTAssertEqual(DTCProtocolFamily(elmID: "5"), .legacy)
         XCTAssertEqual(DTCProtocolFamily(elmID: "1"), .legacy)
-        // 29-bit ISO 15765-4 and J1939 stay out of scope until Phase 3.
-        XCTAssertEqual(DTCProtocolFamily(elmID: "7"), .unsupportedAddressing)
-        XCTAssertEqual(DTCProtocolFamily(elmID: "9"), .unsupportedAddressing)
+        // 29-bit ISO 15765-4 parses from Phase 3; J1939 and the unmapped protocols do not.
+        XCTAssertEqual(DTCProtocolFamily(elmID: "7"), .can29)
+        XCTAssertEqual(DTCProtocolFamily(elmID: "9"), .can29)
         XCTAssertEqual(DTCProtocolFamily(elmID: "A"), .unsupportedAddressing)
         XCTAssertEqual(DTCProtocolFamily(elmID: nil), .unsupportedAddressing)
     }
 
-    /// A 29-bit response fails explicitly: present but unparseable, never clean, never silent.
+    /// An unparseable addressing family fails explicitly: present but unrecoverable, never
+    /// clean, never silent. (J1939 and the unmapped user protocols B/C, per D5.)
     func testUnsupportedAddressingIsInvalidWhenBytesArrive() {
         let lines = ["18 DA F1 10 02 43 00"]
         XCTAssertEqual(
@@ -383,24 +381,6 @@ final class DTCScanPhase1Tests: XCTestCase {
             DTCResponseParser.parse(lines: ["NO DATA"], service: .stored, family: .unsupportedAddressing),
             .noResponse
         )
-    }
-
-    // MARK: - Profiles
-
-    func testUnimplementedProfilesThrowBeforeAnyIO() async {
-        for profile in [DTCScanProfile.full, .quickConnect] {
-            let comm = ScriptedComm(responses: ["03": ["7E8 02 43 00"]])
-            let sut = makeELM327(comm: comm)
-            do {
-                _ = try await sut.scanForTroubleCodes(profile: profile)
-                XCTFail("Expected .profileUnsupported for \(profile)")
-            } catch let error as DTCScanError {
-                XCTAssertEqual(error, .profileUnsupported(profile))
-            } catch {
-                XCTFail("Expected DTCScanError, got \(error)")
-            }
-            XCTAssertTrue(comm.sentCommands.isEmpty, "No I/O may happen for \(profile)")
-        }
     }
 
     // MARK: - Transport boundary
@@ -510,69 +490,17 @@ final class DTCScanPhase1Tests: XCTestCase {
         )
     }
 
-    // MARK: - Deprecated dictionary wrapper
+    // MARK: - Multi-ECU projection
 
-    func testWrapperKeysCodesByProjectedECUID() async throws {
-        let comm = ScriptedComm(responses: ["03": ["7E8 02 43 00", "7E9 04 43 01 15 53"]])
-        let sut = makeELM327(comm: comm)
+    /// Two non-engine modules keep distinct raw addresses. The removed dictionary API collapsed
+    /// both onto `ECUID.unknown`; the report keys by the address the vehicle answered with.
+    func testTwoNonEngineRespondersStayDistinct() throws {
+        let result = parseCAN(["7EA 04 43 01 01 04", "7EB 04 43 01 05 00"])
 
-        let dictionary = try await sut.scanForTroubleCodes()
-
-        XCTAssertEqual(dictionary[.transmission]?.map(\.code), ["P1553"])
-        XCTAssertNil(dictionary[.engine], "A clean responder contributes no codes")
-    }
-
-    func testWrapperReturnsAnEmptyDictionaryForAVerifiedCleanScan() async throws {
-        let comm = ScriptedComm(responses: ["03": ["7E8 02 43 00"]])
-        let sut = makeELM327(comm: comm)
-
-        let dictionary = try await sut.scanForTroubleCodes()
-
-        XCTAssertTrue(dictionary.isEmpty)
-    }
-
-    func testWrapperMergesECUIDCollisionsInsteadOfOverwriting() async throws {
-        let comm = ScriptedComm(responses: ["03": ["7EA 04 43 01 01 04", "7EB 04 43 01 05 00"]])
-        let sut = makeELM327(comm: comm)
-
-        let dictionary = try await sut.scanForTroubleCodes()
-
-        // 0x7EA and 0x7EB both project to `.unknown`; neither may be dropped.
-        XCTAssertEqual(absECU.ecuID, .unknown)
-        XCTAssertEqual(bodyECU.ecuID, .unknown)
-        XCTAssertEqual(dictionary[.unknown]?.map(\.code), ["P0104", "P0500"])
-    }
-
-    func testWrapperThrowsWhenAnyResponderIsNotPositive() async {
-        let cases: [String: [String]] = [
-            "malformed": ["7E8 04 43 01 00 00"],
-            "negative": ["7E8 03 7F 03 11"],
-            "invalid": ["43", "0F", "7"],
-            "headerOnlyDamage": ["7E8 02 43 00", "7E8"],
-            "mixedDamage": ["7E8 06 43 02 01 04 05 00", "7E9 07 43 01 04"],
-        ]
-        for (name, lines) in cases {
-            let comm = ScriptedComm(responses: ["03": lines])
-            let sut = makeELM327(comm: comm)
-            do {
-                let dictionary = try await sut.scanForTroubleCodes()
-                XCTFail("Expected \(name) to throw, got \(dictionary)")
-            } catch {
-                XCTAssertTrue(error is ELM327Error, "Unexpected error for \(name): \(error)")
-            }
-        }
-    }
-
-    func testWrapperThrowsOnSilenceInsteadOfReportingClean() async {
-        let comm = ScriptedComm(error: BLEManagerError.noData)
-        let sut = makeELM327(comm: comm)
-
-        do {
-            let dictionary = try await sut.scanForTroubleCodes()
-            XCTFail("NO DATA must not read as clean, got \(dictionary)")
-        } catch {
-            XCTAssertTrue(error is ELM327Error, "Unexpected error: \(error)")
-        }
+        let responders = try responders(result)
+        XCTAssertEqual(responders.count, 2)
+        XCTAssertEqual(codes(try outcome(result, absECU)), ["P0104"])
+        XCTAssertEqual(codes(try outcome(result, bodyECU)), ["P0500"])
     }
 
     // MARK: - Demo transport

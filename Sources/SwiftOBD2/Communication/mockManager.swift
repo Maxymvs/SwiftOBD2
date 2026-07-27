@@ -16,10 +16,26 @@ enum CommandAction {
     case echoOff
 }
 
+/// Which DTC picture the mock transport paints, so demo mode can exercise more than one.
+///
+/// The mock used to answer Mode 03 with two hardcoded codes and nothing else — demo mode always
+/// *showed* codes, which masked field failures during development and left the verified-clean
+/// path with no way to be seen at all.
+public enum MockDTCScenario: String, Sendable, CaseIterable {
+    /// The historic default: two stored codes, no pending, no permanent.
+    case codes
+    /// Verified clean across every service (`43 00` / `47 00` / `4A 00`).
+    case clean
+    /// Nothing stored, one pending code — the "other apps show a code" case.
+    case pendingOnly
+}
+
 struct MockECUSettings {
     var headerOn = true
     var echo = false
     var vinNumber = ""
+    /// Which DTC scenario the mock answers 03/07/0A (and the `0101` count) with.
+    var dtcScenario: MockDTCScenario = .codes
 }
 
 class MOCKComm: CommProtocol {
@@ -45,7 +61,7 @@ class MOCKComm: CommProtocol {
                 let index = command.index(command.startIndex, offsetBy: i)
                 let nextIndex = command.index(command.startIndex, offsetBy: i + 2)
                 let subCommand = prefix + String(command[index..<nextIndex])
-                guard let value = OBDCommand.mockResponse(forCommand: subCommand) else {
+                guard let value = mockResponse(forSubCommand: subCommand) else {
                     return ["No Data"]
 
                 }
@@ -143,24 +159,13 @@ class MOCKComm: CommProtocol {
             }
             return response
 
-        } else if command == "03" {
-            // 03 is a request for DTCs
-            let dtcs = ["P0104", "U0207"]
-            // Two bytes per code, behind the `43` mode byte and the CAN count byte — the ISO-TP
-            // declared length must cover exactly those bytes, or the response is malformed.
-            let codeBytes = dtcs.flatMap { String($0.suffix(4)).chunked(by: 2) }
-            obdDebug("Generated DTC hex: \(codeBytes.joined(separator: " "))", category: .communication)
-            if ecuSettings.headerOn {
-                header = "7E8"
-            }
-            let payload = ["43", String(format: "%02X", dtcs.count)] + codeBytes
-            var response = ([header] + [String(format: "%02X", payload.count)] + payload)
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
-            while response.count < 26 {
-                response.append(" 00")
-            }
-            return [response]
+        } else if let service = DTCService.allCases.first(where: { $0.requestMode == command }) {
+            // A coherent answer for every DTC service, so a `.full` scan works in demo mode
+            // instead of leaving 07/0A unanswered.
+            return [dtcResponse(for: service)]
+        } else if command == "04" {
+            // Mode 04 must answer with a verified `44`, or the (now verifying) clear throws.
+            return [ecuSettings.headerOn ? "7E8 01 44" : "01 44"]
         } else {
             guard var response = OBDCommand.mockResponse(forCommand: command) else {
                 return ["No Data"]
@@ -172,6 +177,45 @@ class MOCKComm: CommProtocol {
             lines.removeLast()
             return lines
         }
+    }
+
+    /// The codes the current scenario reports for one service.
+    private func mockCodes(for service: DTCService) -> [String] {
+        switch (ecuSettings.dtcScenario, service) {
+        case (.codes, .stored): return ["P0104", "U0207"]
+        case (.pendingOnly, .pending): return ["P0301"]
+        default: return []
+        }
+    }
+
+    /// A well-formed single-frame response: `<header> <length> <mode> <count> <pairs…>`, padded
+    /// beyond the ISO-TP declared length (which the DTC parser correctly ignores).
+    private func dtcResponse(for service: DTCService) -> String {
+        let codes = mockCodes(for: service)
+        let codeBytes = codes.flatMap { String($0.suffix(4)).chunked(by: 2) }
+        let mode = String(format: "%02X", service.positiveResponseByte)
+        let payload = [mode, String(format: "%02X", codes.count)] + codeBytes
+        obdDebug(
+            "Mock \(service.requestMode) (\(ecuSettings.dtcScenario.rawValue)): \(payload.joined(separator: " "))",
+            category: .communication
+        )
+        var response = ([ecuSettings.headerOn ? "7E8" : ""] + [String(format: "%02X", payload.count)] + payload)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        while response.count < 26 {
+            response.append(" 00")
+        }
+        return response
+    }
+
+    /// Scenario-aware mock values. Only the `0101` status is scenario-dependent: its MIL bit and
+    /// DTC count must agree with the codes the mock reports, or a clean demo scan would be
+    /// contradicted by a status claiming codes (and would raise a spurious coverage-gap warning).
+    private func mockResponse(forSubCommand subCommand: String) -> String? {
+        guard subCommand == "0101" else { return OBDCommand.mockResponse(forCommand: subCommand) }
+        let storedCount = mockCodes(for: .stored).count
+        let byteA = String(format: "%02X", (storedCount > 0 ? 0x80 : 0x00) | storedCount)
+        return "01 " + byteA + " 34 56 78 00"
     }
 
     func disconnectPeripheral() {

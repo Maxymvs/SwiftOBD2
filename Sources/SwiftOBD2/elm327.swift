@@ -73,6 +73,28 @@ class ELM327 {
 
     private var r100: [String] = []
 
+    /// The vehicle the current session is talking to (its VIN when the adapter gave us one).
+    var vehicleIdentifier: String?
+
+    /// Identity of the current connection, regenerated on every reset.
+    ///
+    /// Stands in for the VIN when the adapter never gave us one, so advisory evidence gathered
+    /// from a VIN-less vehicle can never be attributed to the *next* VIN-less vehicle.
+    private var connectionSessionID = UUID()
+
+    /// The scope advisory unsupported-service evidence is keyed by: the VIN when known — shared
+    /// across reconnects to the same car — otherwise this connection's session id.
+    var dtcEvidenceScope: String {
+        if let vin = vehicleIdentifier, !vin.isEmpty {
+            return DTCUnsupportedServiceKey.vin(vin)
+        }
+        return DTCUnsupportedServiceKey.session(connectionSessionID)
+    }
+
+    /// Advisory record of terminal service-not-supported refusals (D10). Injectable; never
+    /// consulted to suppress a request.
+    var unsupportedServiceStore: DTCUnsupportedServiceStore = InMemoryDTCUnsupportedServiceStore()
+
     var connectionState: ConnectionState = .disconnected {
         didSet {
             obdDelegate?.connectionStateChanged(state: connectionState)
@@ -118,9 +140,12 @@ class ELM327 {
         //        }
 
         //        self.obdProtocol = obdProtocol
-        canProtocol = protocols[detectedProtocol]
+        // Unmapped protocols (the user-configurable CAN protocols B/C) fail loudly here instead
+        // of leaving a silent `nil` parser that only surfaces as an unrelated parse failure.
+        canProtocol = try detectedProtocol.parserImplementation()
 
         let vin = await requestVin()
+        vehicleIdentifier = vin
 
         //        try await setHeader(header: "7E0")
 
@@ -263,6 +288,10 @@ class ELM327 {
     func resetState() {
         canProtocol = nil
         r100 = []
+        vehicleIdentifier = nil
+        // A new connection is a new vehicle until proven otherwise: never let the previous
+        // (possibly VIN-less) car's advisory evidence apply to this one.
+        connectionSessionID = UUID()
     }
 
     // MARK: - Message Sending
@@ -292,20 +321,26 @@ class ELM327 {
         return statusCommand.properties.decode(data: statusData)
     }
 
-    /// Deprecated dictionary scan, reimplemented as a thin wrapper over the report pipeline
-    /// (`DTCScanRequest.swift`) so there is exactly one Mode 03 parse path.
+    /// Clears stored trouble codes and freeze-frame data, **verifying** the `44` positive
+    /// response.
     ///
-    /// Returns the merged stored codes only when every responder answered positively, and throws
-    /// otherwise — silence, refusal, damage and transport trouble all used to decode as an empty
-    /// *success*. An empty dictionary now means verified clean.
-    func scanForTroubleCodes() async throws -> [ECUID: [TroubleCode]] {
-        let report = try await scanForTroubleCodes(profile: .storedOnly)
-        return try report.legacyStoredCodeDictionary()
-    }
-
+    /// The response used to be discarded (`_ = try await sendCommand`), so an ECU that refused
+    /// the request — or an adapter that answered nothing at all — looked exactly like a
+    /// successful clear. A clear is now a success only when at least one responder returned a
+    /// verified `44`; a refusal or an unverifiable response throws.
     func clearTroubleCodes() async throws {
         let command = OBDCommand.Mode4.CLEAR_DTC
-        _ = try await sendCommand(command.properties.command)
+        let response = try await sendCommand(command.properties.command)
+        switch DTCResponseParser.clearOutcome(lines: response, family: dtcProtocolFamily) {
+        case .verified:
+            obdInfo("Clear codes verified by a 44 positive response", category: .service)
+        case let .refused(nrc):
+            obdError("Clear codes refused by the vehicle (NRC \(nrc))", category: .service)
+            throw ELM327Error.invalidResponse(message: "Vehicle refused mode 04 (NRC \(nrc))")
+        case .unverified:
+            obdError("Clear codes unverified — no 44 response", category: .service)
+            throw ELM327Error.invalidResponse(message: "No 44 response to mode 04")
+        }
     }
 
     func scanForPeripherals() async throws {

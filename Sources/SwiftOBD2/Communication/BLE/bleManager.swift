@@ -527,6 +527,15 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         let acquired = await commandSemaphore.wait()
         guard acquired else { throw CancellationError() }
         defer { commandSemaphore.signal() }
+        return try await sendCommandLocked(command, retries: retries)
+    }
+
+    /// The write-and-await body of `sendCommand`, with the command mutex **already held**.
+    ///
+    /// Split out so a multi-window transaction can send and then keep listening under a single
+    /// acquisition; `AsyncSemaphore` is not reentrant, so a transaction must never call
+    /// `sendCommand` itself.
+    private func sendCommandLocked(_ command: String, retries: Int) async throws -> [String] {
         try Task.checkCancellation()
 
         for attempt in 1...retries {
@@ -559,6 +568,69 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         throw BLEManagerError.noData
     }
 
+
+    /// Sends once, then re-arms the response handler for as many windows as the exchange needs —
+    /// **never writing again** — with the command mutex held across the whole transaction.
+    ///
+    /// Holding the mutex is the point: releasing it between windows would let telemetry polling
+    /// write into the middle of the exchange and swallow the ECU's final message. Each window is
+    /// armed with `beginContinuationRequest()`, which keeps the buffer, so a final message that
+    /// landed in the gap since the last `>` is drained instead of lost.
+    ///
+    /// A window that times out (or reports `NO DATA`) ends the transaction with whatever arrived;
+    /// cancellation and link loss are rethrown, so the caller can treat them as the terminal
+    /// interruptions they are instead of publishing a report built on stale interim evidence.
+    func sendCommandTransaction(
+        _ command: String,
+        retries: Int,
+        shouldContinueListening: @escaping @Sendable ([String]) -> Bool,
+        listenDeadline: TimeInterval
+    ) async throws -> [String] {
+        let acquired = await commandSemaphore.wait()
+        guard acquired else { throw CancellationError() }
+        defer { commandSemaphore.signal() }
+
+        var accumulated = try await sendCommandLocked(command, retries: retries)
+        let started = Date()
+
+        while shouldContinueListening(accumulated) {
+            try Task.checkCancellation()
+            let remaining = listenDeadline - Date().timeIntervalSince(started)
+            guard remaining > 0 else {
+                obdDebug("Extra listen budget exhausted for \(command)", category: .communication)
+                break
+            }
+            guard peripheralManager.connectedPeripheral != nil else {
+                throw BLEManagerError.peripheralNotConnected
+            }
+
+            let token = messageProcessor.beginContinuationRequest()
+            do {
+                let response = try await messageProcessor.awaitResponse(
+                    for: token,
+                    timeout: min(remaining, BLEConstants.defaultTimeout)
+                )
+                obdDebug("Extra listen window delivered: \(response.joined(separator: " | "))", category: .communication)
+                accumulated.append(contentsOf: response)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as BLEMessageProcessorError where error == .staleRequestToken {
+                throw error // the processor was reset under us: a disconnect, not a quiet ECU
+            } catch let error as BLEManagerError {
+                // `NO DATA` in a listen window means nothing more came; anything else (peripheral
+                // gone, unauthorized, …) is terminal and must never read as silence.
+                if case .noData = error { break }
+                throw error
+            } catch {
+                obdDebug(
+                    "Extra listen window ended with no response: \(error.localizedDescription)",
+                    category: .communication
+                )
+                break
+            }
+        }
+        return accumulated
+    }
 
     func scanForPeripherals() async throws {
         startScanning(nil)
