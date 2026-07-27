@@ -267,6 +267,94 @@ final class DTCContractTests: XCTestCase {
         XCTAssertNotEqual(DTCScanError.profileUnsupported(.full), .profileUnsupported(.quickConnect))
     }
 
+    // MARK: - Shared warning derivation (report ⇔ partial scan)
+
+    /// The evidence a `.full` scan had collected when the link dropped: ECU A promised two
+    /// stored codes and answered verified-clean (coverage gap), ECU B claimed none yet
+    /// answered with a code (informational), and the ABS module's reply was unusable
+    /// (salvage). An interrupted scan's evidence is as real as a completed scan's, so the
+    /// partial must derive exactly the warnings a report over the same evidence would.
+    private func crossCheckEvidence() throws -> (
+        services: [DTCService: DTCServiceResult],
+        statusRead: DTCStatusReadResult
+    ) {
+        var gapped = Status()
+        gapped.dtcCount = 2
+        let clean = Status()
+        let statuses = try XCTUnwrap(DTCStatusResponders([
+            engine: .responded(gapped),
+            transmission: .responded(clean)
+        ]))
+        let services: [DTCService: DTCServiceResult] = [
+            .stored: try answered([
+                engine: .responded(codes: []),
+                transmission: .responded(codes: [observation("P0104", .stored, transmission)]),
+                abs: .malformed
+            ])
+        ]
+        return (services, .answered(statuses))
+    }
+
+    func testPartialScanDerivesTheSameWarningsAReportWould() throws {
+        let evidence = try crossCheckEvidence()
+        let expected: [DTCScanWarning] = [
+            .storedCodeCoverageGap(ecuAddress: engine, reportedCount: 2),
+            .codesDespiteZeroCount(ecuAddress: transmission, recoveredCount: 1),
+            .salvagedResponder(ecuAddress: abs, service: .stored)
+        ]
+
+        let partial = try DTCPartialScan(
+            profile: .full,
+            services: evidence.services,
+            statusRead: evidence.statusRead
+        )
+        XCTAssertEqual(partial.warnings, expected)
+
+        // The same evidence published as a report (storedOnly requires only Mode 03).
+        let report = try DTCScanReport(
+            profile: .storedOnly,
+            services: evidence.services,
+            statusRead: evidence.statusRead
+        )
+        XCTAssertEqual(report.warnings, partial.warnings, "one derivation, two carriers")
+    }
+
+    func testInterruptedScanCarriesItsWarningsThroughTheError() throws {
+        let evidence = try crossCheckEvidence()
+        let partial = try DTCPartialScan(
+            profile: .full,
+            services: evidence.services,
+            statusRead: evidence.statusRead
+        )
+        guard case let .connectionLost(carried) = DTCScanError.connectionLost(partial) else {
+            return XCTFail("wrong case")
+        }
+        XCTAssertEqual(carried.warnings, partial.warnings)
+        XCTAssertTrue(carried.warnings.contains(.storedCodeCoverageGap(ecuAddress: engine, reportedCount: 2)))
+    }
+
+    func testPartialScanWithoutStatusEvidenceDerivesNoCrossCheckWarnings() throws {
+        let partial = try DTCPartialScan(profile: .full, services: [
+            .stored: try answered([engine: .responded(codes: [])])
+        ])
+        XCTAssertTrue(partial.warnings.isEmpty, "no 0101 evidence means no cross-check")
+
+        let empty = DTCPartialScan.empty(profile: .full)
+        XCTAssertTrue(empty.warnings.isEmpty, "an interruption before any service warns about nothing")
+    }
+
+    func testPartialScanSalvageWarningsFollowServiceOrder() throws {
+        let partial = try DTCPartialScan(profile: .full, services: [
+            .pending: try answered([engine: .malformed]),
+            .stored: try answered([transmission: .malformed, engine: .malformed])
+        ])
+        XCTAssertEqual(partial.warnings, [
+            .salvagedResponder(ecuAddress: engine, service: .stored),
+            .salvagedResponder(ecuAddress: transmission, service: .stored),
+            .salvagedResponder(ecuAddress: engine, service: .pending)
+        ])
+    }
+
     // MARK: - Observation flattening
 
     func testObservationsFlattenAcrossServicesAndECUsPreservingKindAndAddress() throws {
