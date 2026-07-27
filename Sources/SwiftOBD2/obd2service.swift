@@ -358,35 +358,47 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// damage and recoverable transport failures are all distinct outcomes in the report, and
     /// every claim is scoped to the profile that was requested.
     ///
-    /// - Parameter profile: Which services to request. Only ``DTCScanProfile/storedOnly`` is
-    ///   implemented today.
-    /// - Returns: The scan report. `statusRead` is `.notAttempted` — the caller still reads
-    ///   `0101` itself.
-    /// - Throws: Only ``DTCScanError`` — `.profileUnsupported` (raised before any I/O),
-    ///   `.cancelled`/`.connectionLost` carrying the evidence completed so far. Raw transport
-    ///   errors never escape.
+    /// - Parameter profile: Which services to request — `.storedOnly` (03), `.quickConnect`
+    ///   (03 + 07) or `.full` (03 + 07 + 0A).
+    /// - Returns: The scan report, including the per-responder `0101` status read.
+    /// - Throws: Only ``DTCScanError`` — `.cancelled`/`.connectionLost` carrying the evidence
+    ///   completed so far. Raw transport errors never escape.
     public func scanForTroubleCodes(profile: DTCScanProfile) async throws -> DTCScanReport {
         try await elm327.scanForTroubleCodes(profile: profile)
     }
 
-    ///  Scans for trouble codes and returns the result.
-    ///  - Returns: The trouble codes found on the vehicle.
-    ///  - Throws: Errors that might occur during the request process.
+    // MARK: - Advisory unsupported-service evidence
+
+    /// The advisory record of modules that answered a DTC service with a terminal
+    /// service-not-supported NRC (`0x11`/`0x12`), scoped to vehicle + ECU + protocol.
     ///
-    ///  Superseded by ``scanForTroubleCodes(profile:)``: a dictionary cannot carry per-responder
-    ///  outcomes, so this projection throws for every non-positive result — an empty dictionary
-    ///  means *verified clean*.
-    public func scanForTroubleCodes() async throws -> [ECUID: [TroubleCode]] {
-        do {
-            return try await elm327.scanForTroubleCodes()
-        } catch {
-            throw OBDServiceError.scanFailed(underlyingError: error)
-        }
+    /// **Advisory only** — nothing in the scan path reads it to suppress a request, because a
+    /// generic DTC request is a broadcast and one module's refusal says nothing about another's.
+    /// Use it to scope wording to its evidence ("ECU 0x7EA previously rejected permanent-code
+    /// reads"), never for a vehicle-wide claim.
+    public var unsupportedDTCServices: Set<DTCUnsupportedServiceKey> {
+        elm327.unsupportedServiceStore.unsupportedKeys
+    }
+
+    /// Replaces the advisory unsupported-service store (e.g. with a persistent implementation).
+    public func setUnsupportedDTCServiceStore(_ store: DTCUnsupportedServiceStore) {
+        elm327.unsupportedServiceStore = store
+    }
+
+    /// Demo/simulator only: which DTC scenario the mock transport answers with. Ignored for real
+    /// transports, so demo mode can exercise the clean and pending-only paths that the old
+    /// always-two-codes mock hid.
+    @discardableResult
+    public func setMockDTCScenario(_ scenario: MockDTCScenario) -> Bool {
+        guard let mock = elm327.commManager as? MOCKComm else { return false }
+        mock.ecuSettings.dtcScenario = scenario
+        return true
     }
 
     /// Clears the trouble codes found on the vehicle.
     ///  - Throws: Errors that might occur during the request process.
-    ///     - `OBDServiceError.notConnectedToVehicle` if the adapter is not connected to a vehicle.
+    ///     - `OBDServiceError.clearFailed` when the vehicle refused the request or no `44`
+    ///       positive response could be verified — a failed clear no longer looks successful.
     public func clearTroubleCodes() async throws {
         do {
             try await elm327.clearTroubleCodes()

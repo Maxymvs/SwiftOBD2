@@ -95,6 +95,72 @@ public struct DTCScanReport: Sendable, Equatable {
     public var isCoverageComplete: Bool {
         services.values.allSatisfy(\.isCoverageComplete)
     }
+
+    /// The advisory findings derived from this report's own evidence — never supplied.
+    ///
+    /// Three distinct notices in a deterministic order: the two per-ECU `0101` cross-check
+    /// directions (D2) first, by ascending ECU address, then the salvage notices in service
+    /// order. All three are **advisory** — a notice never suppresses a code, a service or a
+    /// request — but they differ in consequence, which each case documents.
+    ///
+    /// The cross-check is strictly per ECU and only over *stored* codes (`0101` counts nothing
+    /// else): a count difference *between* modules is normal and produces nothing at all.
+    public var warnings: [DTCScanWarning] {
+        var warnings: [DTCScanWarning] = []
+
+        if case let .answered(statuses) = statusRead, let stored = services[.stored]?.responders {
+            for address in statuses.addresses {
+                guard let statusOutcome = statuses[address], let storedOutcome = stored[address],
+                      case let .responded(status) = statusOutcome,
+                      case let .responded(codes) = storedOutcome
+                else { continue }
+                if status.dtcCount > 0, codes.isEmpty {
+                    warnings.append(.storedCodeCoverageGap(ecuAddress: address, reportedCount: status.dtcCount))
+                } else if status.dtcCount == 0, !codes.isEmpty {
+                    warnings.append(.codesDespiteZeroCount(ecuAddress: address, recoveredCount: codes.count))
+                }
+            }
+        }
+
+        for service in DTCService.allCases {
+            guard let responders = services[service]?.responders else { continue }
+            for address in responders.addresses where responders[address] == .malformed {
+                warnings.append(.salvagedResponder(ecuAddress: address, service: service))
+            }
+        }
+
+        return warnings
+    }
+}
+
+// MARK: - Warnings
+
+/// An advisory finding derived from a report's own evidence.
+///
+/// Advisory does not mean consequence-free: the three cases differ precisely in what they imply
+/// for completeness, which is why they are separate values rather than one flat warning list.
+public enum DTCScanWarning: Sendable, Hashable {
+    /// This ECU's `0101` read reported stored codes, but that same ECU's Mode 03 answer was a
+    /// verified-clean `.responded([])` — the codes the count promised were never recovered.
+    ///
+    /// **Consequence: incomplete.** The scan renders and persists as incomplete for that module
+    /// rather than clean, and the result leaves the stored-code recurrence denominator.
+    case storedCodeCoverageGap(ecuAddress: ECUAddress, reportedCount: UInt8)
+
+    /// This ECU reported a `0101` count of zero yet answered Mode 03 with real codes.
+    ///
+    /// **Consequence: none — informational.** No evidence was lost, so completeness is unchanged
+    /// and the codes are shown exactly as recovered. Common and legitimate: `0101` counts only
+    /// confirmed, MIL-relevant emissions codes.
+    case codesDespiteZeroCount(ecuAddress: ECUAddress, recoveredCount: Int)
+
+    /// This responder's message was recorded as `.malformed` while other responders' valid
+    /// messages were kept.
+    ///
+    /// **Consequence: user-visible.** Usually redundant with the coverage table — a malformed
+    /// responder already breaks `isCoverageComplete` — but surfaced so the salvage is stated
+    /// rather than implied: nothing was silently dropped.
+    case salvagedResponder(ecuAddress: ECUAddress, service: DTCService)
 }
 
 // MARK: - Partial scan
@@ -170,6 +236,10 @@ public enum DTCScanError: Error, Sendable, Equatable {
     /// The link was lost before or during the scan; carries what had completed.
     case connectionLost(DTCPartialScan)
     /// The requested profile is not implemented — never a silently partial report.
+    ///
+    /// Every profile is implemented today (`.storedOnly`, `.quickConnect`, `.full`), so nothing
+    /// raises this; the case stays so a future capability refusal has somewhere honest to go
+    /// instead of degrading into a short report.
     case profileUnsupported(DTCScanProfile)
 }
 
