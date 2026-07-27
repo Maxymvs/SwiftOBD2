@@ -106,30 +106,7 @@ public struct DTCScanReport: Sendable, Equatable {
     /// The cross-check is strictly per ECU and only over *stored* codes (`0101` counts nothing
     /// else): a count difference *between* modules is normal and produces nothing at all.
     public var warnings: [DTCScanWarning] {
-        var warnings: [DTCScanWarning] = []
-
-        if case let .answered(statuses) = statusRead, let stored = services[.stored]?.responders {
-            for address in statuses.addresses {
-                guard let statusOutcome = statuses[address], let storedOutcome = stored[address],
-                      case let .responded(status) = statusOutcome,
-                      case let .responded(codes) = storedOutcome
-                else { continue }
-                if status.dtcCount > 0, codes.isEmpty {
-                    warnings.append(.storedCodeCoverageGap(ecuAddress: address, reportedCount: status.dtcCount))
-                } else if status.dtcCount == 0, !codes.isEmpty {
-                    warnings.append(.codesDespiteZeroCount(ecuAddress: address, recoveredCount: codes.count))
-                }
-            }
-        }
-
-        for service in DTCService.allCases {
-            guard let responders = services[service]?.responders else { continue }
-            for address in responders.addresses where responders[address] == .malformed {
-                warnings.append(.salvagedResponder(ecuAddress: address, service: service))
-            }
-        }
-
-        return warnings
+        deriveWarnings(services: services, statusRead: statusRead)
     }
 }
 
@@ -224,6 +201,16 @@ public struct DTCPartialScan: Sendable, Equatable {
     public var observations: [DTCObservation] {
         flattenObservations(services)
     }
+
+    /// The same advisory findings ``DTCScanReport/warnings`` derives, over the evidence
+    /// that left the library inside a ``DTCScanError`` instead of a published report.
+    ///
+    /// Shared derivation, not a parallel one: a cancelled scan's coverage-gap and salvage
+    /// evidence is exactly as real as a completed scan's (D3 forbids discarding it), so
+    /// both types read the same rule rather than two copies that can drift apart.
+    public var warnings: [DTCScanWarning] {
+        deriveWarnings(services: services, statusRead: statusRead)
+    }
 }
 
 // MARK: - Errors
@@ -276,6 +263,44 @@ private func firstAttributionMismatch(
 }
 
 // MARK: - Shared derivation
+
+/// The one implementation of the D2/D17 advisory findings, shared by ``DTCScanReport``
+/// and ``DTCPartialScan`` so a completed scan and an interrupted one can never disagree
+/// about the same evidence.
+///
+/// Order is deterministic: the two per-ECU `0101` cross-check directions first, by
+/// ascending ECU address, then the salvage notices in service order. The cross-check is
+/// strictly per ECU and only over *stored* codes — `0101` counts nothing else — so a
+/// count difference *between* modules produces nothing at all.
+private func deriveWarnings(
+    services: [DTCService: DTCServiceResult],
+    statusRead: DTCStatusReadResult
+) -> [DTCScanWarning] {
+    var warnings: [DTCScanWarning] = []
+
+    if case let .answered(statuses) = statusRead, let stored = services[.stored]?.responders {
+        for address in statuses.addresses {
+            guard let statusOutcome = statuses[address], let storedOutcome = stored[address],
+                  case let .responded(status) = statusOutcome,
+                  case let .responded(codes) = storedOutcome
+            else { continue }
+            if status.dtcCount > 0, codes.isEmpty {
+                warnings.append(.storedCodeCoverageGap(ecuAddress: address, reportedCount: status.dtcCount))
+            } else if status.dtcCount == 0, !codes.isEmpty {
+                warnings.append(.codesDespiteZeroCount(ecuAddress: address, recoveredCount: codes.count))
+            }
+        }
+    }
+
+    for service in DTCService.allCases {
+        guard let responders = services[service]?.responders else { continue }
+        for address in responders.addresses where responders[address] == .malformed {
+            warnings.append(.salvagedResponder(ecuAddress: address, service: service))
+        }
+    }
+
+    return warnings
+}
 
 /// Flattens responder observations in a deterministic order: service lineage order first
 /// (stored → pending → permanent), then ascending ECU address, then decode order.
