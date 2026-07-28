@@ -97,19 +97,26 @@ final class DTCContractTests: XCTestCase {
         }
     }
 
-    func testQuickConnectValidWithAndWithoutPermanent() throws {
-        let withoutPermanent = try DTCScanReport(profile: .quickConnect, services: [
+    func testQuickConnectBuildsFromStoredAndPending() throws {
+        let report = try DTCScanReport(profile: .quickConnect, services: [
             .stored: try cleanService(engine),
             .pending: try cleanService(engine)
         ])
-        XCTAssertNil(withoutPermanent.services[.permanent])
+        XCTAssertEqual(report.services.count, 2)
+        XCTAssertNil(report.services[.permanent])
+    }
 
-        let withPermanent = try DTCScanReport(profile: .quickConnect, services: [
+    /// RFC §7 Q1 resolved: the connect-time quick check never requests Mode 0A, so a
+    /// quick-check report claiming permanent-code coverage must be UNCONSTRUCTIBLE — not
+    /// merely unproduced by today's request order.
+    func testQuickConnectRejectsPermanentService() throws {
+        XCTAssertThrowsError(try DTCScanReport(profile: .quickConnect, services: [
             .stored: try cleanService(engine),
             .pending: try cleanService(engine),
             .permanent: try cleanService(engine)
-        ])
-        XCTAssertEqual(withPermanent.services.count, 3)
+        ])) { error in
+            XCTAssertEqual(error as? DTCScanReport.ValidationError, .serviceOutsideProfile(.permanent))
+        }
     }
 
     func testStoredOnlyReportBuildsWithJustStored() throws {
@@ -132,14 +139,17 @@ final class DTCContractTests: XCTestCase {
         XCTAssertTrue(report.observations.isEmpty)
     }
 
-    func testAttemptedOptionalPermanentCodesBreakQuickConnectClean() throws {
-        let report = try DTCScanReport(profile: .quickConnect, services: [
+    /// The former "optional permanent codes break quick-check clean" case: permanent
+    /// evidence can no longer reach a `.quickConnect` report at all, so the honesty
+    /// property is now enforced by construction rather than by the clean predicate.
+    func testPermanentCodesCannotHideInsideAQuickCheck() throws {
+        XCTAssertThrowsError(try DTCScanReport(profile: .quickConnect, services: [
             .stored: try cleanService(engine),
             .pending: try cleanService(engine),
             .permanent: try answered([engine: .responded(codes: [observation("P0420", .permanent, engine)])])
-        ])
-        XCTAssertFalse(report.isCleanForProfile, "permanent codes must not hide inside a clean quick check")
-        XCTAssertTrue(report.isCoverageComplete, "codes are still full coverage")
+        ])) { error in
+            XCTAssertEqual(error as? DTCScanReport.ValidationError, .serviceOutsideProfile(.permanent))
+        }
     }
 
     func testCleanIsFalseForEveryNonRespondedOutcome() throws {
@@ -490,7 +500,11 @@ final class DTCContractTests: XCTestCase {
         XCTAssertEqual(DTCScanProfile.full.requiredServices, [.stored, .pending, .permanent])
         XCTAssertEqual(DTCScanProfile.full.allowedServices, DTCScanProfile.full.requiredServices)
         XCTAssertEqual(DTCScanProfile.quickConnect.requiredServices, [.stored, .pending])
-        XCTAssertEqual(DTCScanProfile.quickConnect.allowedServices, [.stored, .pending, .permanent])
+        XCTAssertEqual(
+            DTCScanProfile.quickConnect.allowedServices, DTCScanProfile.quickConnect.requiredServices,
+            "Q1 resolved: the quick check never requests 0A, so it may not report it either"
+        )
+        XCTAssertFalse(DTCScanProfile.quickConnect.allowedServices.contains(.permanent))
         for profile in DTCScanProfile.allCases {
             XCTAssertTrue(
                 profile.requiredServices.isSubset(of: profile.allowedServices),

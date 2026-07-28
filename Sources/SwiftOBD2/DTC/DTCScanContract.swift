@@ -327,7 +327,7 @@ public enum DTCScanProfile: String, Sendable, Hashable, Codable, CaseIterable {
     case storedOnly
     /// A user-initiated full scan: stored + pending + permanent, all required.
     case full
-    /// The connect-time quick check: stored + pending required, permanent optional.
+    /// The connect-time quick check: stored + pending, and nothing else.
     case quickConnect
 
     /// Services that must be present in a report for this profile.
@@ -341,11 +341,18 @@ public enum DTCScanProfile: String, Sendable, Hashable, Codable, CaseIterable {
 
     /// Services a report for this profile may contain. Anything else is a validation
     /// failure; the difference from ``requiredServices`` is the profile's optional set.
+    ///
+    /// No profile has an optional set today. `.quickConnect` used to allow `.permanent`
+    /// so that a "0A on every Nth connection" cadence could be added without a contract
+    /// change; the auto-scan work (RFC §7 Q1) decided the quick check **never** requests
+    /// Mode 0A, so that allowance now only made a report claiming permanent-code coverage
+    /// constructible under a profile that cannot have obtained it. Tightened to match the
+    /// request order.
     public var allowedServices: Set<DTCService> {
         switch self {
         case .storedOnly: return [.stored]
         case .full: return [.stored, .pending, .permanent]
-        case .quickConnect: return [.stored, .pending, .permanent]
+        case .quickConnect: return [.stored, .pending]
         }
     }
 }

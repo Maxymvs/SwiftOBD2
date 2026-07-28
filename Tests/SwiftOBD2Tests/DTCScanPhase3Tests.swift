@@ -210,8 +210,8 @@ final class DTCScanPhase3Tests: XCTestCase {
         XCTAssertTrue(report.warnings.isEmpty)
     }
 
-    /// `quickConnect` stops at 07 — whether 0A ever joins is a cadence decision, and an
-    /// unrequested service is simply absent from the map.
+    /// `quickConnect` stops at 07 — RFC §7 Q1 resolved that 0A never joins on any cadence,
+    /// and an unrequested service is simply absent from the map.
     func testQuickConnectProfileOmitsPermanentCodes() async throws {
         let comm = ScriptedComm(responses: [
             "0101": [Self.cleanStatusLines],

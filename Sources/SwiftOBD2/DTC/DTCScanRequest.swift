@@ -181,9 +181,10 @@ extension DTCResponderOutcome {
 extension DTCScanProfile {
     /// The services this profile requests, in the order they are sent.
     ///
-    /// `.quickConnect` deliberately stops at 07: whether the connect-time check ever includes
-    /// Mode 0A (and on what cadence) is a profile decision that belongs to the auto-scan work,
-    /// and a report simply has no 0A key when it was not requested.
+    /// `.quickConnect` stops at 07, permanently: the auto-scan work resolved RFC §7 Q1 as
+    /// "the connect-time check never requests Mode 0A — on any cadence", and
+    /// ``DTCScanProfile/allowedServices`` was tightened to match, so a quick-check report
+    /// claiming permanent-code coverage is now unconstructible rather than merely unproduced.
     var requestOrder: [DTCService] {
         switch self {
         case .storedOnly: return [.stored]
