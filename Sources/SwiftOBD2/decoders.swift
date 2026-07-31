@@ -21,7 +21,21 @@ public struct Status: Codable, Hashable, Sendable {
     public var MIL: Bool = false
     public var dtcCount: UInt8 = 0
     /// `"Spark"` or `"Compression"`.
+    ///
+    /// **Display-only.** Derived from the same byte-B bit as
+    /// ``ECUReadiness/ignitionType``, which is the authoritative typed value (it is the bit
+    /// that selected the readiness table). Kept for existing consumers.
     public var ignitionType: String = ""
+
+    /// This responder's decoded SAE J1979 readiness monitors, when the payload carried all
+    /// four status bytes.
+    ///
+    /// `nil` means "readiness was not decodable from this payload" — never "no monitors" and
+    /// never "complete". Additive: every producer in the library populates it, and the only
+    /// in-scope producer of `Status` (``DTCResponseParser/parseStatus(lines:family:)``)
+    /// requires all four bytes, so a `nil` here reaching a consumer means a direct decoder
+    /// call with a short payload.
+    public var readiness: ECUReadiness?
 
     var misfireMonitoring = StatusTest()
     var fuelSystemMonitoring = StatusTest()
@@ -723,12 +737,21 @@ struct StatusDecoder: Decoder {
         //  10111110 00011111 10101000 00010011
         //   [# DTC] X        [supprt] [~ready]
 
+        // Short-data ladder (bytes A–B are indexed unconditionally below, so a guard is
+        // required before any of it): < 2 bytes → `.invalidData`; 2–3 bytes → A/B decoded
+        // with `readiness == nil`; 4+ bytes → full readiness. The parser never produces the
+        // middle rung — it classifies anything shorter than four status bytes as damage —
+        // but direct decoder callers get a specified answer rather than a crash.
+        guard data.count >= 2 else { return .failure(.invalidData) }
+
         // convert to binaryarray
         let bits = BitArray(data: data)
 
         var output = Status()
         output.MIL = bits.binaryArray[0] == 1
         output.dtcCount = bits.value(at: 1 ..< 8)
+        let ignitionType: ECUReadiness.IgnitionType =
+            bits.binaryArray[12] == 1 ? .compression : .spark
         output.ignitionType = IGNITIONTYPE[bits.binaryArray[12]]
 
         // load the 3 base tests that are always present
@@ -736,7 +759,52 @@ struct StatusDecoder: Decoder {
         for (index, name) in baseTests.reversed().enumerated() {
             processBaseTest(name, index, bits, &output)
         }
+
+        if data.count >= 4 {
+            output.readiness = Self.decodeReadiness(bits: bits.binaryArray, ignitionType: ignitionType)
+        }
         return .success(.statusResult(output))
+    }
+
+    /// Projects bytes B (continuous) and C/D (non-continuous) into an ``ECUReadiness``.
+    ///
+    /// `bits` is `BitArray`'s MSB-first array, so byte *n*'s bit *k* sits at
+    /// `8 * n + (7 - k)`: byte B bit0 → 15, byte C bit0 → 23, byte D bit0 → 31.
+    ///
+    /// - Byte B: bit0/1/2 = misfire/fuel/components *supported*; bit4/5/6 = the matching
+    ///   *incomplete* flags (bit3 is the ignition type, bit7 reserved).
+    /// - Byte C: non-continuous *supported* bitmap; byte D: non-continuous *incomplete*
+    ///   bitmap, read through the ignition-selected table. Reserved table positions are
+    ///   never decoded, whatever their bit value.
+    /// - `unsupported` wins: when the supported bit is 0 the D bit is undefined noise (some
+    ///   ECUs set it arbitrarily) and must not be read.
+    ///
+    /// The result is built through ``ECUReadiness/init(ignitionType:monitors:)``, so the
+    /// decoder is held to the same totality invariant as any other caller. It fills exactly
+    /// the applicable key set, so the `nil` branch is unreachable by construction.
+    static func decodeReadiness(
+        bits: [Int],
+        ignitionType: ECUReadiness.IgnitionType
+    ) -> ECUReadiness? {
+        func state(supportedBit: Int, incompleteBit: Int) -> ReadinessMonitorState {
+            guard bits[supportedBit] == 1 else { return .unsupported }
+            return bits[incompleteBit] == 1 ? .incomplete : .complete
+        }
+
+        var monitors: [ReadinessMonitor: ReadinessMonitorState] = [:]
+
+        // Byte B — the three continuous monitors, bit0…2 supported / bit4…6 incomplete.
+        for (bit, monitor) in ECUReadiness.continuousMonitors.enumerated() {
+            monitors[monitor] = state(supportedBit: 15 - bit, incompleteBit: 15 - (bit + 4))
+        }
+
+        // Bytes C/D — the ignition-selected non-continuous table.
+        for (bit, monitor) in ECUReadiness.nonContinuousTable(for: ignitionType).enumerated() {
+            guard let monitor else { continue } // reserved position: never a monitor
+            monitors[monitor] = state(supportedBit: 23 - bit, incompleteBit: 31 - bit)
+        }
+
+        return ECUReadiness(ignitionType: ignitionType, monitors: monitors)
     }
 
     func processBaseTest(_ testName: String, _ index: Int, _ bits: BitArray, _ output: inout Status) {
