@@ -124,10 +124,17 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             ]
         )
 
+        let adapterRegistry = BLEAdapterRegistry.standard
         messageProcessor = BLEMessageProcessor()
-        characteristicHandler = BLECharacteristicHandler(messageProcessor: messageProcessor)
-        peripheralManager = BLEPeripheralManager(characteristicHandler: characteristicHandler)
-        peripheralScanner = BLEPeripheralScanner()
+        characteristicHandler = BLECharacteristicHandler(
+            messageProcessor: messageProcessor,
+            adapterRegistry: adapterRegistry
+        )
+        peripheralManager = BLEPeripheralManager(
+            characteristicHandler: characteristicHandler,
+            adapterRegistry: adapterRegistry
+        )
+        peripheralScanner = BLEPeripheralScanner(adapterRegistry: adapterRegistry)
     }
 
     // MARK: - Central Manager Control Methods
@@ -462,7 +469,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         if let peripheral = peripheral {
             targetPeripheral = peripheral
         } else {
-            startScanning(BLEPeripheralScanner.supportedServices)
+            startScanning(peripheralScanner.supportedServices)
             targetPeripheral = try await peripheralScanner.waitForFirstPeripheral(timeout: timeout)
         }
 

@@ -4,84 +4,67 @@ import CoreBluetooth
 
 class BLECharacteristicHandler {
     private var ecuReadCharacteristic: CBCharacteristic?
-       private var ecuWriteCharacteristic: CBCharacteristic?
-       private let messageProcessor: BLEMessageProcessor
-       private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.example.app", category: "BLECharacteristicHandler")
+    private var ecuWriteCharacteristic: CBCharacteristic?
+    private var writeType: CBCharacteristicWriteType?
+    private let messageProcessor: BLEMessageProcessor
+    private let adapterRegistry: BLEAdapterRegistry
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.example.app", category: "BLECharacteristicHandler")
 
-       var isReady: Bool {
-           ecuReadCharacteristic != nil && ecuWriteCharacteristic != nil
-       }
+    var isReady: Bool {
+        ecuReadCharacteristic != nil && ecuWriteCharacteristic != nil && writeType != nil
+    }
 
-       init(messageProcessor: BLEMessageProcessor) {
-           self.messageProcessor = messageProcessor
-       }
+    init(messageProcessor: BLEMessageProcessor, adapterRegistry: BLEAdapterRegistry = .standard) {
+        self.messageProcessor = messageProcessor
+        self.adapterRegistry = adapterRegistry
+    }
 
+    func setupCharacteristics(
+        _ characteristics: [CBCharacteristic],
+        for service: CBService,
+        on peripheral: CBPeripheral
+    ) {
+        let descriptors = characteristics.map {
+            BLECharacteristicDescriptor(uuid: $0.uuid.uuidString, capabilities: Self.capabilities(for: $0))
+        }
 
-    func setupCharacteristics(_ characteristics: [CBCharacteristic], on peripheral: CBPeripheral) {
-           for characteristic in characteristics {
-               // Set up notifications for characteristics that support it
-               if characteristic.properties.contains(.notify) {
-                   peripheral.setNotifyValue(true, for: characteristic)
-               }
+        switch adapterRegistry.resolve(serviceUUID: service.uuid.uuidString, characteristics: descriptors) {
+        case let .success(binding):
+            guard let readCharacteristic = characteristics.first(where: {
+                $0.uuid.uuidString.uppercased() == binding.readCharacteristicUUID
+            }), let writeCharacteristic = characteristics.first(where: {
+                $0.uuid.uuidString.uppercased() == binding.writeCharacteristicUUID
+            }) else {
+                return
+            }
 
-               // Assign characteristics based on UUID and properties
-               switch characteristic.uuid.uuidString.uppercased() {
-               case "FFE1": // for service FFE0 (read and write)
-                   if characteristic.properties.contains(.write) {
-                       ecuWriteCharacteristic = characteristic
-                   }
-                   if characteristic.properties.contains(.read) || characteristic.properties.contains(.notify) {
-                       ecuReadCharacteristic = characteristic
-                   }
+            ecuReadCharacteristic = readCharacteristic
+            ecuWriteCharacteristic = writeCharacteristic
+            writeType = binding.writeType.coreBluetoothType
 
-               case "FFF1": // for service FFF0 (read only)
-                   if characteristic.properties.contains(.read) || characteristic.properties.contains(.notify) {
-                       ecuReadCharacteristic = characteristic
-                   }
+            if readCharacteristic.properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: readCharacteristic)
+            }
 
-               case "FFF2": // for service FFF0 (write only)
-                   if characteristic.properties.contains(.write) {
-                       ecuWriteCharacteristic = characteristic
-                   }
-
-               case "2AF0": // for service 18F0 (read)
-                   if characteristic.properties.contains(.read) || characteristic.properties.contains(.notify) {
-                       ecuReadCharacteristic = characteristic
-                   }
-
-               case "2AF1": // for service 18F0 (write)
-                   if characteristic.properties.contains(.write) {
-                       ecuWriteCharacteristic = characteristic
-                   }
-
-               default:
-                   logger.debug("Unknown characteristic: \(characteristic.uuid.uuidString)")
-               }
-           }
-
-        logger.info("Characteristics setup - Read: \(self.ecuReadCharacteristic != nil), Write: \(self.ecuWriteCharacteristic != nil)")
-       }
+            logger.info("Configured adapter profile \(binding.profile.id, privacy: .public) - Read: \(binding.readCharacteristicUUID, privacy: .public), Write: \(binding.writeCharacteristicUUID, privacy: .public)")
+        case let .failure(error):
+            logger.debug("Adapter profile did not resolve for service \(service.uuid.uuidString, privacy: .public): \(String(describing: error), privacy: .public)")
+        }
+    }
 
     func discoverCharacteristics(for service: CBService, on peripheral: CBPeripheral) {
-        switch service.uuid {
-        case CBUUID(string: "FFE0"):
-            peripheral.discoverCharacteristics([CBUUID(string: "FFE1")], for: service)
-        case CBUUID(string: "FFF0"):
-            peripheral.discoverCharacteristics([CBUUID(string: "FFF1"), CBUUID(string: "FFF2")], for: service)
-        case CBUUID(string: "18F0"):
-            peripheral.discoverCharacteristics([CBUUID(string: "2AF0"), CBUUID(string: "2AF1")], for: service)
-        default:
-            peripheral.discoverCharacteristics(nil, for: service)
-        }
+        guard let profile = adapterRegistry.profile(forServiceUUID: service.uuid.uuidString) else { return }
+        peripheral.discoverCharacteristics(profile.characteristicUUIDs.map(CBUUID.init(string:)), for: service)
     }
 
     func writeCommand(_ command: String, to peripheral: CBPeripheral) throws {
         guard let characteristic = ecuWriteCharacteristic,
+              let writeType,
               let data = "\(command)\r".data(using: .ascii) else {
             throw BLEManagerError.missingPeripheralOrCharacteristic
         }
 
-        peripheral.writeValue(data, for: characteristic, type: .withResponse)
+        peripheral.writeValue(data, for: characteristic, type: writeType)
         logger.info("Sent command: \(command)")
     }
 
@@ -110,5 +93,24 @@ class BLECharacteristicHandler {
 
         ecuReadCharacteristic = nil
         ecuWriteCharacteristic = nil
+        writeType = nil
+    }
+
+    private static func capabilities(for characteristic: CBCharacteristic) -> BLECharacteristicCapabilities {
+        var capabilities: BLECharacteristicCapabilities = []
+        if characteristic.properties.contains(.read) { capabilities.insert(.read) }
+        if characteristic.properties.contains(.notify) { capabilities.insert(.notify) }
+        if characteristic.properties.contains(.write) { capabilities.insert(.writeWithResponse) }
+        if characteristic.properties.contains(.writeWithoutResponse) { capabilities.insert(.writeWithoutResponse) }
+        return capabilities
+    }
+}
+
+private extension BLEAdapterWriteType {
+    var coreBluetoothType: CBCharacteristicWriteType {
+        switch self {
+        case .withResponse: return .withResponse
+        case .withoutResponse: return .withoutResponse
+        }
     }
 }

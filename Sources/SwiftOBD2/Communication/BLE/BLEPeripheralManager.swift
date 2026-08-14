@@ -15,6 +15,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     @Published var connectedPeripheral: CBPeripheral?
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.example.app", category: "BLEPeripheralManager")
     private let characteristicHandler: BLECharacteristicHandler
+    private let adapterRegistry: BLEAdapterRegistry
 
     weak var delegate: BLEPeripheralManagerDelegate?
     private var connectionCompletion: ((CBPeripheral?, Error?) -> Void)?
@@ -34,8 +35,12 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         var value: Task<Void, Never>?
     }
 
-    init(characteristicHandler: BLECharacteristicHandler) {
+    init(
+        characteristicHandler: BLECharacteristicHandler,
+        adapterRegistry: BLEAdapterRegistry = .standard
+    ) {
         self.characteristicHandler = characteristicHandler
+        self.adapterRegistry = adapterRegistry
         super.init()
     }
 
@@ -56,7 +61,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         connectedPeripheral?.delegate = self
 
         if discoverServices, let peripheral = peripheral, peripheral.state == .connected {
-            peripheral.discoverServices(BLEPeripheralScanner.supportedServices)
+            peripheral.discoverServices(adapterRegistry.serviceUUIDs.map(CBUUID.init(string:)))
         }
     }
 
@@ -175,7 +180,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         guard let characteristics = service.characteristics else { return }
 
-        characteristicHandler.setupCharacteristics(characteristics, on: peripheral)
+        characteristicHandler.setupCharacteristics(characteristics, for: service, on: peripheral)
 
         // Check if all required characteristics are set up
         if characteristicHandler.isReady {

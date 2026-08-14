@@ -25,17 +25,21 @@ class BLEPeripheralScanner: ObservableObject {
         peripheralSubject.eraseToAnyPublisher()
     }
 
-    static let supportedServices = [
-        CBUUID(string: "FFE0"),
-        CBUUID(string: "FFF0"),
-        CBUUID(string: "18F0"), // e.g. VGate iCar Pro
-    ]
+    private let adapterRegistry: BLEAdapterRegistry
+
+    var supportedServices: [CBUUID] {
+        adapterRegistry.serviceUUIDs.map(CBUUID.init(string:))
+    }
 
     private var foundPeripheralCompletion: ((CBPeripheral?, Error?) -> Void)?
     private var hasResumedPeripheral = false
 
     /// Scan generation counter to invalidate stale callbacks from previous scans
     private var scanGeneration: Int = 0
+
+    init(adapterRegistry: BLEAdapterRegistry = .standard) {
+        self.adapterRegistry = adapterRegistry
+    }
 
     /// Reset all discovered peripherals for clean reconnection
     func reset() {
