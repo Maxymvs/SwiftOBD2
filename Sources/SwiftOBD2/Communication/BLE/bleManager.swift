@@ -393,11 +393,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
             // Check peripheral state before restoring
             if peripheral.state == .connected {
-                // Peripheral still connected - set up properly
+                // Peripheral still connected - rediscover and wait for the
+                // notification subscription before publishing adapter readiness.
                 peripheralManager.setPeripheral(peripheral, discoverServices: true)
-                connectionState = .connectedToAdapter
                 cancelConnectTimeout()
-                obdInfo("Restored connected peripheral", category: .bluetooth)
+                obdInfo("Restored connected peripheral; validating adapter channel", category: .bluetooth)
             } else if peripheral.state == .connecting {
                 // A pending connect survived app termination (standing
                 // reconnect). Leave it pending with no timeout — iOS completes

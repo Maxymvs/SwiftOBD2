@@ -20,6 +20,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     weak var delegate: BLEPeripheralManagerDelegate?
     private var connectionCompletion: ((CBPeripheral?, Error?) -> Void)?
     private var hasResumedConnection = false
+    private var hasCompletedSetup = false
 
     /// Connection generation counter to invalidate stale callbacks from previous connections
     private var connectionGeneration: Int = 0
@@ -49,6 +50,9 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         // Clear delegate before clearing peripheral reference.
         connectedPeripheral?.delegate = nil
         connectedPeripheral = nil
+        resumeLock.withLock {
+            hasCompletedSetup = false
+        }
 
         // Resume any pending setup wait through the single, lock-guarded sink so
         // its continuation can't leak. No-op if nothing is waiting.
@@ -59,6 +63,9 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         connectedPeripheral?.delegate = nil
         connectedPeripheral = peripheral
         connectedPeripheral?.delegate = self
+        resumeLock.withLock {
+            hasCompletedSetup = false
+        }
 
         if discoverServices, let peripheral = peripheral, peripheral.state == .connected {
             peripheral.discoverServices(adapterRegistry.serviceUUIDs.map(CBUUID.init(string:)))
@@ -182,14 +189,42 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         characteristicHandler.setupCharacteristics(characteristics, for: service, on: peripheral)
 
-        // Check if all required characteristics are set up
-        if characteristicHandler.isReady {
-            // Routed through the lock-guarded sink, which handles exactly-once resume.
-            fireConnectionCompletion(peripheral: peripheral, error: nil)
+        completeSetupIfReady(peripheral)
+    }
 
-            // Notify delegate
-            delegate?.peripheralManager(self, didSetupCharacteristics: peripheral)
+    func didUpdateNotificationState(
+        _ peripheral: CBPeripheral,
+        characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        guard peripheral.identifier == connectedPeripheral?.identifier else {
+            logger.warning("Received notification state for unknown peripheral \(peripheral.identifier), ignoring")
+            return
         }
+        guard characteristicHandler.handlesNotificationState(for: characteristic) else { return }
+
+        if let error {
+            logger.error("Failed to subscribe to adapter notifications: \(error.localizedDescription)")
+            fireConnectionCompletion(peripheral: nil, error: error)
+            return
+        }
+
+        guard characteristicHandler.handleNotificationStateUpdate(for: characteristic) else { return }
+        completeSetupIfReady(peripheral)
+    }
+
+    private func completeSetupIfReady(_ peripheral: CBPeripheral) {
+        guard characteristicHandler.isReady else { return }
+        let shouldComplete = resumeLock.withLock { () -> Bool in
+            guard !hasCompletedSetup else { return false }
+            hasCompletedSetup = true
+            return true
+        }
+        guard shouldComplete else { return }
+
+        // Routed through the lock-guarded sink, which handles exactly-once resume.
+        fireConnectionCompletion(peripheral: peripheral, error: nil)
+        delegate?.peripheralManager(self, didSetupCharacteristics: peripheral)
     }
 
     func didUpdateValue(_ peripheral: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
@@ -220,5 +255,9 @@ extension BLEPeripheralManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         didUpdateValue(peripheral, characteristic: characteristic, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        didUpdateNotificationState(peripheral, characteristic: characteristic, error: error)
     }
 }

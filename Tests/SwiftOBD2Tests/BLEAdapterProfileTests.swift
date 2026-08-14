@@ -106,7 +106,7 @@ final class BLEAdapterProfileTests: XCTestCase {
     func testSharedCharacteristicBindsForReadAndWrite() throws {
         let binding = try registry.resolve(
             serviceUUID: "FFE0",
-            characteristics: [descriptor("FFE1", [.read, .writeWithResponse])]
+            characteristics: [descriptor("FFE1", [.notify, .writeWithResponse])]
         ).get()
 
         XCTAssertEqual(binding.readCharacteristicUUID, binding.writeCharacteristicUUID)
@@ -181,6 +181,45 @@ final class BLEAdapterProfileTests: XCTestCase {
             ).failure,
             .unsupportedWriteProperties("FFF2")
         )
+    }
+
+    func testReadOnlyCharacteristicDoesNotResolveWithoutAResponseDeliveryPath() {
+        let result = registry.resolve(
+            serviceUUID: "FFE0",
+            characteristics: [descriptor("FFE1", [.read, .writeWithResponse])]
+        )
+
+        XCTAssertEqual(result.failure, .unsupportedReadProperties("FFE1"))
+    }
+
+    func testIndicationCharacteristicProvidesAResponseDeliveryPath() throws {
+        let binding = try registry.resolve(
+            serviceUUID: "FFE0",
+            characteristics: [descriptor("FFE1", [.indicate, .writeWithResponse])]
+        ).get()
+
+        XCTAssertEqual(binding.readCharacteristicUUID, "FFE1")
+    }
+
+    func testNotificationReadinessWaitsForSubscriptionConfirmation() {
+        var readiness = BLENotificationReadiness()
+
+        readiness.begin(alreadySubscribed: false)
+        XCTAssertFalse(readiness.isReady)
+
+        readiness.update(isNotifying: true)
+        XCTAssertTrue(readiness.isReady)
+
+        readiness.reset()
+        XCTAssertFalse(readiness.isReady)
+    }
+
+    func testNotificationReadinessAcceptsRestoredSubscription() {
+        var readiness = BLENotificationReadiness()
+
+        readiness.begin(alreadySubscribed: true)
+
+        XCTAssertTrue(readiness.isReady)
     }
 
     private func descriptor(

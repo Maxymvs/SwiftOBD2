@@ -6,12 +6,16 @@ class BLECharacteristicHandler {
     private var ecuReadCharacteristic: CBCharacteristic?
     private var ecuWriteCharacteristic: CBCharacteristic?
     private var writeType: CBCharacteristicWriteType?
+    private var notificationReadiness = BLENotificationReadiness()
     private let messageProcessor: BLEMessageProcessor
     private let adapterRegistry: BLEAdapterRegistry
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.example.app", category: "BLECharacteristicHandler")
 
     var isReady: Bool {
-        ecuReadCharacteristic != nil && ecuWriteCharacteristic != nil && writeType != nil
+        ecuReadCharacteristic != nil
+            && ecuWriteCharacteristic != nil
+            && writeType != nil
+            && notificationReadiness.isReady
     }
 
     init(messageProcessor: BLEMessageProcessor, adapterRegistry: BLEAdapterRegistry = .standard) {
@@ -41,8 +45,9 @@ class BLECharacteristicHandler {
             ecuReadCharacteristic = readCharacteristic
             ecuWriteCharacteristic = writeCharacteristic
             writeType = binding.writeType.coreBluetoothType
+            notificationReadiness.begin(alreadySubscribed: readCharacteristic.isNotifying)
 
-            if readCharacteristic.properties.contains(.notify) {
+            if !readCharacteristic.isNotifying {
                 peripheral.setNotifyValue(true, for: readCharacteristic)
             }
 
@@ -79,6 +84,18 @@ class BLECharacteristicHandler {
         messageProcessor.processReceivedData(data)
     }
 
+    /// Records CoreBluetooth's asynchronous subscription result. The caller
+    /// must not declare the adapter ready until this returns true.
+    func handleNotificationStateUpdate(for characteristic: CBCharacteristic) -> Bool {
+        guard characteristic == ecuReadCharacteristic else { return false }
+        notificationReadiness.update(isNotifying: characteristic.isNotifying)
+        return isReady
+    }
+
+    func handlesNotificationState(for characteristic: CBCharacteristic) -> Bool {
+        characteristic == ecuReadCharacteristic
+    }
+
     func reset(peripheral: CBPeripheral? = nil) {
         // Unsubscribe from notifications before clearing references
         // This prevents ghost notifications arriving after disconnect
@@ -94,12 +111,14 @@ class BLECharacteristicHandler {
         ecuReadCharacteristic = nil
         ecuWriteCharacteristic = nil
         writeType = nil
+        notificationReadiness.reset()
     }
 
     private static func capabilities(for characteristic: CBCharacteristic) -> BLECharacteristicCapabilities {
         var capabilities: BLECharacteristicCapabilities = []
         if characteristic.properties.contains(.read) { capabilities.insert(.read) }
         if characteristic.properties.contains(.notify) { capabilities.insert(.notify) }
+        if characteristic.properties.contains(.indicate) { capabilities.insert(.indicate) }
         if characteristic.properties.contains(.write) { capabilities.insert(.writeWithResponse) }
         if characteristic.properties.contains(.writeWithoutResponse) { capabilities.insert(.writeWithoutResponse) }
         return capabilities

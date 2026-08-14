@@ -14,6 +14,29 @@ struct BLECharacteristicCapabilities: OptionSet, Equatable, Sendable {
     static let notify = Self(rawValue: 1 << 1)
     static let writeWithResponse = Self(rawValue: 1 << 2)
     static let writeWithoutResponse = Self(rawValue: 1 << 3)
+    static let indicate = Self(rawValue: 1 << 4)
+}
+
+/// Tracks the asynchronous notification subscription that must complete before
+/// commands can safely be sent to an adapter.
+struct BLENotificationReadiness: Equatable, Sendable {
+    private(set) var isSubscriptionConfirmed = false
+
+    var isReady: Bool {
+        isSubscriptionConfirmed
+    }
+
+    mutating func begin(alreadySubscribed: Bool) {
+        isSubscriptionConfirmed = alreadySubscribed
+    }
+
+    mutating func update(isNotifying: Bool) {
+        isSubscriptionConfirmed = isNotifying
+    }
+
+    mutating func reset() {
+        isSubscriptionConfirmed = false
+    }
 }
 
 struct BLECharacteristicDescriptor: Equatable, Sendable {
@@ -143,7 +166,7 @@ struct BLEAdapterRegistry: Sendable {
         guard readMatches.count == 1, let read = readMatches.first else {
             return .failure(.ambiguousCharacteristic(profile.readCharacteristicUUID))
         }
-        guard read.capabilities.contains(.read) || read.capabilities.contains(.notify) else {
+        guard read.capabilities.contains(.notify) || read.capabilities.contains(.indicate) else {
             return .failure(.unsupportedReadProperties(profile.readCharacteristicUUID))
         }
 
