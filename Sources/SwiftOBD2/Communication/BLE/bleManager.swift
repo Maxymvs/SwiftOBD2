@@ -124,10 +124,17 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             ]
         )
 
+        let adapterRegistry = BLEAdapterRegistry.standard
         messageProcessor = BLEMessageProcessor()
-        characteristicHandler = BLECharacteristicHandler(messageProcessor: messageProcessor)
-        peripheralManager = BLEPeripheralManager(characteristicHandler: characteristicHandler)
-        peripheralScanner = BLEPeripheralScanner()
+        characteristicHandler = BLECharacteristicHandler(
+            messageProcessor: messageProcessor,
+            adapterRegistry: adapterRegistry
+        )
+        peripheralManager = BLEPeripheralManager(
+            characteristicHandler: characteristicHandler,
+            adapterRegistry: adapterRegistry
+        )
+        peripheralScanner = BLEPeripheralScanner(adapterRegistry: adapterRegistry)
     }
 
     // MARK: - Central Manager Control Methods
@@ -386,11 +393,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
             // Check peripheral state before restoring
             if peripheral.state == .connected {
-                // Peripheral still connected - set up properly
+                // Peripheral still connected - rediscover and wait for the
+                // notification subscription before publishing adapter readiness.
                 peripheralManager.setPeripheral(peripheral, discoverServices: true)
-                connectionState = .connectedToAdapter
                 cancelConnectTimeout()
-                obdInfo("Restored connected peripheral", category: .bluetooth)
+                obdInfo("Restored connected peripheral; validating adapter channel", category: .bluetooth)
             } else if peripheral.state == .connecting {
                 // A pending connect survived app termination (standing
                 // reconnect). Leave it pending with no timeout — iOS completes
@@ -462,7 +469,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         if let peripheral = peripheral {
             targetPeripheral = peripheral
         } else {
-            startScanning(BLEPeripheralScanner.supportedServices)
+            startScanning(peripheralScanner.supportedServices)
             targetPeripheral = try await peripheralScanner.waitForFirstPeripheral(timeout: timeout)
         }
 
