@@ -108,15 +108,18 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Throws: Errors that might occur during the connection process.
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7, peripheral: CBPeripheral? = nil) async throws -> OBDInfo {
         let startTime = CFAbsoluteTimeGetCurrent()
+        var connectionStage = OBDConnectionStage.adapterTransport
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
 
         do {
             obdDebug("Connecting to adapter...", category: .connection)
             try await elm327.connectToAdapter(timeout: timeout, peripheral: peripheral)
 
+            connectionStage = .adapterInitialization
             obdDebug("Initializing adapter...", category: .connection)
             try await elm327.adapterInitialization()
 
+            connectionStage = .vehicleCommunication
             obdDebug("Initializing vehicle connection...", category: .connection)
             let vehicleInfo = try await initializeVehicle(preferedProtocol)
 
@@ -138,8 +141,8 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         } catch {
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection failed", duration: duration, success: false)
-            obdError("Connection failed: \(error.localizedDescription)", category: .connection)
-            throw OBDServiceError.adapterConnectionFailed(underlyingError: error) // Propagate
+            obdError("Connection failed during \(connectionStage.rawValue): \(error.localizedDescription)", category: .connection)
+            throw OBDServiceError.connectionFailed(stage: connectionStage, underlyingError: error)
         }
     }
 
@@ -506,9 +509,16 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
 }
 
+public enum OBDConnectionStage: String, Sendable {
+    case adapterTransport = "adapter transport"
+    case adapterInitialization = "adapter initialization"
+    case vehicleCommunication = "vehicle communication"
+}
+
 public enum OBDServiceError: Error, LocalizedError {
     case noAdapterFound
     case notConnectedToVehicle
+    case connectionFailed(stage: OBDConnectionStage, underlyingError: Error)
     case adapterConnectionFailed(underlyingError: Error)
     case scanFailed(underlyingError: Error)
     case clearFailed(underlyingError: Error)
@@ -520,6 +530,8 @@ public enum OBDServiceError: Error, LocalizedError {
             return "No OBD adapter found."
         case .notConnectedToVehicle:
             return "Not connected to vehicle."
+        case let .connectionFailed(stage, underlyingError):
+            return "Connection failed during \(stage.rawValue): \(underlyingError.localizedDescription)"
         case .adapterConnectionFailed(let underlyingError):
             return "Adapter connection failed: \(underlyingError.localizedDescription)"
         case .scanFailed(let underlyingError):
