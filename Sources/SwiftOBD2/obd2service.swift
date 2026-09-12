@@ -824,7 +824,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     private func markCompatibilityDisconnected() {
         let serviceAttempt = compatibilityAttemptFence.begin()
         guard let manager = currentBLEManager else { return }
-        manager.recordDisconnected()
+        manager.recordDisconnected(expectDisconnectCallback: true)
         let managerAttempt = manager.currentCompatibilityAttemptToken
         DispatchQueue.main.async { [weak self, weak manager] in
             guard let self,

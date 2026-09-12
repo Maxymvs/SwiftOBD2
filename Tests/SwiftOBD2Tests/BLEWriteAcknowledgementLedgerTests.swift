@@ -103,6 +103,10 @@ final class BLEWriteAcknowledgementLedgerTests: XCTestCase {
         await assertThrows(oldTask, AcknowledgementLedgerTestError.disconnected)
 
         ledger.confirmedDisconnect(peripheralID: peripheralID)
+        XCTAssertNil(ledger.consumeAcknowledgement(
+            peripheralID: peripheralID,
+            characteristicUUID: characteristicUUID
+        ))
         let newSession = coordinator.activateSession()
         let newTransport = AcknowledgementLedgerTestTransport(
             maximumLength: 2,
