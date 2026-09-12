@@ -1,0 +1,389 @@
+@testable import SwiftOBD2
+import XCTest
+
+final class BLEAdapterValidationTests: XCTestCase {
+    func testCommandFailureMappingKeepsTransportFailuresPreciseAndIgnoresNoData() {
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: BLEWriteCoordinatorError.deadlineExceeded),
+            .writeTimedOut
+        )
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: BLEWriteCoordinatorError.acknowledgementFailed("rejected")),
+            .writeFailed
+        )
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: BLEMessageProcessorError.responseTimeout),
+            .adapterResponseTimedOut
+        )
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: BLEMessageProcessorError.staleRequestToken),
+            .disconnected
+        )
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: BLEManagerError.peripheralNotConnected),
+            .disconnected
+        )
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: CancellationError()),
+            .cancelled
+        )
+        XCTAssertNil(BLEManager.commandCompatibilityFailure(for: BLEManagerError.noData))
+        XCTAssertNil(BLEManager.commandCompatibilityFailure(for: BLEManagerError.adapterIdentificationRejected))
+    }
+
+    func testDisconnectPreservesTerminalFailureButReplacesSuccessfulState() {
+        let failed = BLECompatibilityReport(
+            profileID: "inferred-gatt",
+            profileVersion: 1,
+            source: .inferred,
+            stage: .failed,
+            subscription: .failed,
+            failure: .notificationSubscriptionFailed
+        )
+        XCTAssertEqual(BLEManager.compatibilityReportAfterDisconnect(failed), failed)
+
+        let compatible = BLECompatibilityReport(
+            profileID: "known",
+            profileVersion: 1,
+            source: .known,
+            stage: .compatible,
+            subscription: .confirmed,
+            failure: nil
+        )
+        let disconnected = BLEManager.compatibilityReportAfterDisconnect(compatible)
+        XCTAssertEqual(disconnected.stage, .disconnected)
+        XCTAssertEqual(disconnected.failure, .disconnected)
+        XCTAssertEqual(disconnected.profileID, compatible.profileID)
+    }
+
+    func testCompatibilityCallbackOwnershipAllowsOnlyCurrentOrExpectedCleanup() {
+        XCTAssertEqual(
+            BLEManager.callbackOwnership(
+                preparedAttempt: 4,
+                activeAttempt: 4,
+                preservedCleanupAttempt: nil
+            ),
+            .current
+        )
+        XCTAssertEqual(
+            BLEManager.callbackOwnership(
+                preparedAttempt: 3,
+                activeAttempt: 4,
+                preservedCleanupAttempt: 4
+            ),
+            .expectedCleanup
+        )
+        XCTAssertEqual(
+            BLEManager.callbackOwnership(
+                preparedAttempt: 3,
+                activeAttempt: 4,
+                preservedCleanupAttempt: nil
+            ),
+            .stale
+        )
+    }
+
+    func testConnectTimeoutRejectsSupersededAttemptEvenForSamePeripheral() {
+        XCTAssertTrue(BLEManager.shouldProcessConnectTimeout(
+            capturedAttempt: 5,
+            activeAttempt: 5,
+            preparedAttempt: 5,
+            fenceIsCurrent: true,
+            isConnecting: true,
+            matchesPeripheral: true
+        ))
+        XCTAssertFalse(BLEManager.shouldProcessConnectTimeout(
+            capturedAttempt: 4,
+            activeAttempt: 5,
+            preparedAttempt: 5,
+            fenceIsCurrent: false,
+            isConnecting: true,
+            matchesPeripheral: true
+        ))
+    }
+
+    func testReconnectCleanupPreservesOnlyTheExplicitCurrentAttempt() {
+        XCTAssertFalse(BLECompatibilityResetPolicy.shouldRecordDisconnected(
+            preservedAttempt: 7,
+            currentAttempt: 7
+        ))
+        XCTAssertTrue(BLECompatibilityResetPolicy.shouldRecordDisconnected(
+            preservedAttempt: nil,
+            currentAttempt: 7
+        ))
+        XCTAssertTrue(BLECompatibilityResetPolicy.shouldRecordDisconnected(
+            preservedAttempt: 6,
+            currentAttempt: 7
+        ))
+    }
+
+    func testATIRequiresRecognizedBoundedELMOrSTNIdentity() {
+        XCTAssertTrue(BLEELMResponseValidator.isAdapterIdentification(["ATI", "ELM327 v1.5", "> "]))
+        XCTAssertTrue(BLEELMResponseValidator.isAdapterIdentification(["STN1110 v4.3"]))
+
+        XCTAssertFalse(BLEELMResponseValidator.isAdapterIdentification(["OK"]))
+        XCTAssertFalse(BLEELMResponseValidator.isAdapterIdentification(["Serial bridge ready"]))
+        XCTAssertFalse(BLEELMResponseValidator.isAdapterIdentification(["ELM327 v1.5", "extra text"]))
+        XCTAssertFalse(BLEELMResponseValidator.isAdapterIdentification([String(repeating: "A", count: 513)]))
+        XCTAssertFalse(BLEELMResponseValidator.isAdapterIdentification(["ELM327 v1.5 🚗"]))
+    }
+
+    func testATE0RequiresAnExactOKResponse() {
+        XCTAssertTrue(BLEELMResponseValidator.isOK(["ATE0", "OK", ">"], echoing: .disableEcho))
+        XCTAssertFalse(BLEELMResponseValidator.isOK(["ATE0"], echoing: .disableEcho))
+        XCTAssertFalse(BLEELMResponseValidator.isOK(["OKAY"], echoing: .disableEcho))
+        XCTAssertFalse(BLEELMResponseValidator.isOK(["OK", "READY"], echoing: .disableEcho))
+    }
+
+    func testValidationStateEnforcesATIThenATE0() {
+        var validation = BLEAdapterValidationState()
+        XCTAssertEqual(validation.nextCommand, .identifyAdapter)
+
+        validation.receive(["ATI", "ELM327 v2.2", ">"])
+        XCTAssertEqual(validation.stage, .awaitingEchoDisable)
+        XCTAssertEqual(validation.nextCommand, .disableEcho)
+
+        validation.receive(["OK"])
+        XCTAssertEqual(validation.stage, .adapterValidated)
+        XCTAssertTrue(validation.isAdapterValidated)
+        XCTAssertFalse(validation.hasVehicleEvidence)
+    }
+
+    func testArbitraryPrintableResponseFailsValidation() {
+        var validation = BLEAdapterValidationState()
+
+        validation.receive(["Wireless serial adapter"])
+
+        XCTAssertEqual(validation.stage, .failed)
+        XCTAssertEqual(validation.failure, .invalidAdapterIdentification)
+        XCTAssertFalse(validation.isAdapterValidated)
+    }
+
+    func testVehicleEvidenceRequiresCompletePIDBitmap() {
+        XCTAssertTrue(BLEELMResponseValidator.hasVehicleResponse(["4100BE3FA813"]))
+        XCTAssertTrue(BLEELMResponseValidator.hasVehicleResponse(["7E8064100BE3FA813"]))
+        XCTAssertTrue(BLEELMResponseValidator.hasVehicleResponse(["7E8 06 41 00 BE 3F A8 13"]))
+        XCTAssertTrue(BLEELMResponseValidator.hasVehicleResponse(["18DAF110064100BE3FA813"]))
+
+        XCTAssertFalse(BLEELMResponseValidator.hasVehicleResponse(["41 00"]))
+        XCTAssertFalse(BLEELMResponseValidator.hasVehicleResponse(["vehicle says 41 00 BE 3F A8 13"]))
+        XCTAssertFalse(BLEELMResponseValidator.hasVehicleResponse(["NO DATA"]))
+        XCTAssertFalse(BLEELMResponseValidator.hasVehicleResponse(["OK"]))
+    }
+
+    func testFailedVehicleProbePreservesAdapterValidationEvidence() {
+        var validation = validatedState()
+        validation.beginVehicleProbe()
+
+        validation.receive(["NO DATA"])
+
+        XCTAssertEqual(validation.stage, .adapterValidated)
+        XCTAssertEqual(validation.failure, .vehicleECUUnavailable)
+        XCTAssertTrue(validation.isAdapterValidated)
+        XCTAssertFalse(validation.hasVehicleEvidence)
+    }
+
+    func testVehicleProbeTimeoutPreservesAdapterValidationEvidence() {
+        var validation = validatedState()
+        validation.beginVehicleProbe()
+
+        validation.fail(.responseTimedOut)
+
+        XCTAssertEqual(validation.stage, .adapterValidated)
+        XCTAssertEqual(validation.failure, .responseTimedOut)
+        XCTAssertTrue(validation.isAdapterValidated)
+    }
+
+    private func validatedState() -> BLEAdapterValidationState {
+        var validation = BLEAdapterValidationState()
+        validation.receive(["ELM327 v1.5"])
+        validation.receive(["OK"])
+        return validation
+    }
+}
+
+final class BLEAdapterBindingCacheTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var suiteName: String!
+
+    override func setUp() {
+        super.setUp()
+        suiteName = "BLEAdapterBindingCacheTests.\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suiteName)
+        defaults = nil
+        suiteName = nil
+        super.tearDown()
+    }
+
+    func testInferredBindingIsNotStoredBeforeAdapterValidation() throws {
+        let cache = BLEAdapterBindingCache(defaults: defaults)
+        let (binding, fingerprint) = try inferredFixture(serviceUUID: "ABCD")
+        var timedOut = BLEAdapterValidationState()
+        timedOut.fail(.responseTimedOut)
+
+        XCTAssertFalse(cache.storeValidatedBinding(
+            binding,
+            forPeripheralID: "peripheral-a",
+            fingerprint: fingerprint,
+            validation: timedOut
+        ))
+        XCTAssertFalse(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-a"))
+
+        var cancelled = BLEAdapterValidationState()
+        cancelled.fail(.cancelled)
+        XCTAssertFalse(cache.storeValidatedBinding(
+            binding,
+            forPeripheralID: "peripheral-a",
+            fingerprint: fingerprint,
+            validation: cancelled
+        ))
+    }
+
+    func testValidatedBindingRoundTripsOnlyForFreshFingerprint() throws {
+        let cache = BLEAdapterBindingCache(defaults: defaults)
+        let (binding, fingerprint) = try inferredFixture(serviceUUID: "ABCD")
+        let validation = validatedState()
+
+        XCTAssertTrue(cache.storeValidatedBinding(
+            binding,
+            forPeripheralID: "peripheral-a",
+            fingerprint: fingerprint,
+            validation: validation
+        ))
+        XCTAssertTrue(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-a"))
+        XCTAssertEqual(
+            cache.record(forPeripheralID: "peripheral-a", fingerprint: fingerprint)?.profileID,
+            BLEAdapterProfile.inferredProfileID
+        )
+
+        let changedFingerprint = BLEGATTFingerprint(services: [
+            service("ABCD", [characteristic("A002", [.notify, .writeWithResponse])]),
+        ])
+        XCTAssertNil(cache.record(
+            forPeripheralID: "peripheral-a",
+            fingerprint: changedFingerprint
+        ))
+        XCTAssertFalse(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-a"))
+    }
+
+    func testProfileVersionChangeInvalidatesCachedRecord() throws {
+        let fingerprint = BLEGATTFingerprint(services: [
+            service("FFE0", [characteristic("FFE1", [.notify, .writeWithResponse])]),
+        ])
+        let binding = try BLEAdapterRegistry.standard.resolve(
+            serviceUUID: "FFE0",
+            characteristics: [characteristic("FFE1", [.notify, .writeWithResponse])]
+        ).get()
+        let original = BLEAdapterBindingCache(defaults: defaults)
+        XCTAssertTrue(original.storeInitializedKnownBinding(
+            binding,
+            forPeripheralID: "peripheral-a",
+            fingerprint: fingerprint
+        ))
+
+        let revisedProfile = BLEAdapterProfile(
+            id: binding.profile.id,
+            displayName: binding.profile.displayName,
+            serviceUUID: binding.profile.serviceUUID,
+            readCharacteristicUUID: binding.profile.readCharacteristicUUID,
+            writeCharacteristicUUID: binding.profile.writeCharacteristicUUID,
+            supportedWriteTypes: binding.profile.supportedWriteTypes,
+            version: binding.profile.version + 1
+        )
+        let revised = BLEAdapterBindingCache(
+            defaults: defaults,
+            registry: BLEAdapterRegistry(profiles: [revisedProfile])
+        )
+
+        XCTAssertFalse(revised.hasCurrentValidatedRecord(forPeripheralID: "peripheral-a"))
+        XCTAssertNil(revised.record(forPeripheralID: "peripheral-a", fingerprint: fingerprint))
+    }
+
+    func testCacheIsBoundedAndCorruptionSafe() throws {
+        var currentTime = Date(timeIntervalSince1970: 1)
+        let cache = BLEAdapterBindingCache(
+            defaults: defaults,
+            maximumEntryCount: 2,
+            now: { currentTime }
+        )
+
+        for index in 0..<3 {
+            currentTime = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            let (binding, fingerprint) = try inferredFixture(serviceUUID: "A00\(index)")
+            XCTAssertTrue(cache.storeValidatedBinding(
+                binding,
+                forPeripheralID: "peripheral-\(index)",
+                fingerprint: fingerprint,
+                validation: validatedState()
+            ))
+        }
+
+        XCTAssertFalse(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-0"))
+        XCTAssertTrue(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-1"))
+        XCTAssertTrue(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-2"))
+
+        defaults.set(Data("not-json".utf8), forKey: "SwiftOBD2.BLEAdapterBindingCache")
+        XCTAssertFalse(cache.hasCurrentValidatedRecord(forPeripheralID: "peripheral-1"))
+        XCTAssertNil(defaults.data(forKey: "SwiftOBD2.BLEAdapterBindingCache"))
+    }
+
+    func testPublicReportContainsOnlyRedactedCompatibilityState() throws {
+        let capturedAt = Date(timeIntervalSince1970: 42)
+        let report = BLECompatibilityReport(
+            profileID: "inferred-gatt",
+            profileVersion: 1,
+            source: .inferred,
+            stage: .adapterValidated,
+            subscription: .confirmed,
+            failure: .vehicleECUUnavailable,
+            capturedAt: capturedAt
+        )
+        let data = try JSONEncoder().encode(report)
+        let encoded = try XCTUnwrap(String(data: data, encoding: .utf8))
+
+        XCTAssertEqual(try JSONDecoder().decode(BLECompatibilityReport.self, from: data), report)
+        XCTAssertFalse(encoded.contains("peripheral"))
+        XCTAssertFalse(encoded.contains("VIN"))
+        XCTAssertFalse(encoded.contains("NO DATA"))
+    }
+
+    private func inferredFixture(
+        serviceUUID: String
+    ) throws -> (BLEAdapterBinding, BLEGATTFingerprint) {
+        let graph = [service(
+            serviceUUID,
+            [characteristic("A001", [.notify, .writeWithResponse])]
+        )]
+        let binding = try BLEAdapterRegistry.standard.resolve(
+            services: graph,
+            inferenceAuthorization: .explicitPeripheralSelection
+        ).get()
+        return (binding, BLEGATTFingerprint(services: graph))
+    }
+
+    private func validatedState() -> BLEAdapterValidationState {
+        var validation = BLEAdapterValidationState()
+        validation.receive(["ELM327 v1.5"])
+        validation.receive(["OK"])
+        return validation
+    }
+
+    private func service(
+        _ uuid: String,
+        _ characteristics: [BLECharacteristicDescriptor]
+    ) -> BLEGATTServiceDescriptor {
+        BLEGATTServiceDescriptor(uuid: uuid, characteristics: characteristics)
+    }
+
+    private func characteristic(
+        _ uuid: String,
+        _ capabilities: BLECharacteristicCapabilities
+    ) -> BLECharacteristicDescriptor {
+        BLECharacteristicDescriptor(uuid: uuid, capabilities: capabilities)
+    }
+}

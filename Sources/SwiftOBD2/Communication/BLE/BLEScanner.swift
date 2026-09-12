@@ -59,7 +59,7 @@ class BLEPeripheralScanner: ObservableObject {
         } else {
             foundPeripherals.append(peripheral)
             peripheralSubject.send(peripheral)
-            logger.info("Found new peripheral: \(peripheral.name ?? "Unnamed") - RSSI: \(rssi)")
+            logger.debug("Found a new peripheral during BLE scan")
         }
 
         // NO hasResumedPeripheral guard here - the closure handles double-resume protection

@@ -63,6 +63,12 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         case armStandingReconnect
     }
 
+    enum CompatibilityCallbackOwnership: Equatable {
+        case current
+        case expectedCleanup
+        case stale
+    }
+
     private let peripheralSubject = PassthroughSubject<CBPeripheral, Never>()
     // Replaced with centralized logging - see connectionStateDidChange for usage
 
@@ -93,6 +99,30 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     private var characteristicHandler: BLECharacteristicHandler!
     private var peripheralManager: BLEPeripheralManager!
     private var peripheralScanner: BLEPeripheralScanner!
+    private let adapterRegistry = BLEAdapterRegistry.standard
+    private let bindingCache = BLEAdapterBindingCache()
+
+    private let compatibilityLock = NSRecursiveLock()
+    private let compatibilitySubject = CurrentValueSubject<BLECompatibilityReport?, Never>(nil)
+    private let compatibilityAttemptFence = BLECompatibilityAttemptFence()
+    private var activeCompatibilityAttempt: UInt64 = 0
+    private var compatibilityReportStorage: BLECompatibilityReport?
+    private var channelValidationTask: Task<Void, Error>?
+    private var channelValidationAttempt: UInt64?
+    private var compatibilityAttemptPreservedDuringReset: UInt64?
+    private var preparedPeripheralAttempt: UInt64?
+
+    var currentCompatibilityReport: BLECompatibilityReport? {
+        compatibilityLock.withLock { compatibilityReportStorage }
+    }
+
+    var compatibilityReportPublisher: AnyPublisher<BLECompatibilityReport?, Never> {
+        compatibilitySubject.eraseToAnyPublisher()
+    }
+
+    var currentCompatibilityAttemptToken: UInt64 {
+        compatibilityLock.withLock { activeCompatibilityAttempt }
+    }
 
     /// Serializes all sendCommand calls — ELM327 can only handle one command at a time
     private let commandSemaphore = AsyncSemaphore(value: 1)
@@ -124,7 +154,6 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             ]
         )
 
-        let adapterRegistry = BLEAdapterRegistry.standard
         messageProcessor = BLEMessageProcessor()
         characteristicHandler = BLECharacteristicHandler(
             messageProcessor: messageProcessor,
@@ -132,9 +161,321 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         )
         peripheralManager = BLEPeripheralManager(
             characteristicHandler: characteristicHandler,
-            adapterRegistry: adapterRegistry
+            adapterRegistry: adapterRegistry,
+            bindingCache: bindingCache
         )
         peripheralScanner = BLEPeripheralScanner(adapterRegistry: adapterRegistry)
+    }
+
+    @discardableResult
+    private func beginCompatibilityAttempt() -> UInt64 {
+        let attempt = compatibilityLock.withLock { () -> UInt64 in
+            let attempt = compatibilityAttemptFence.begin()
+            channelValidationTask?.cancel()
+            channelValidationTask = nil
+            channelValidationAttempt = nil
+            preparedPeripheralAttempt = nil
+            activeCompatibilityAttempt = attempt
+            return attempt
+        }
+        publishCompatibilityReport(
+            stage: .discovery,
+            subscription: .notRequested,
+            attempt: attempt
+        )
+        return attempt
+    }
+
+    private func publishCompatibilityReport(
+        stage: BLECompatibilityStage,
+        subscription: BLESubscriptionStatus,
+        failure: BLECompatibilityFailure? = nil,
+        attempt: UInt64
+    ) {
+        guard compatibilityAttemptFence.isCurrent(attempt) else { return }
+        let mayUseResolvedIdentity = compatibilityLock.withLock {
+            preparedPeripheralAttempt == attempt
+        }
+        let binding = mayUseResolvedIdentity
+            ? peripheralManager?.resolutionSnapshot()?.binding
+            : nil
+        let report = BLECompatibilityReport(
+            binding: binding,
+            stage: stage,
+            subscription: subscription,
+            failure: failure
+        )
+        compatibilityLock.withLock {
+            guard activeCompatibilityAttempt == attempt,
+                  compatibilityAttemptFence.isCurrent(attempt) else { return }
+            compatibilityReportStorage = report
+            compatibilitySubject.send(report)
+        }
+    }
+
+    private func publishCompatibilityFailure(_ error: Error, attempt: UInt64) {
+        let failure: BLECompatibilityFailure
+        if error is CancellationError {
+            failure = .cancelled
+        } else if let writeError = error as? BLEWriteCoordinatorError {
+            failure = writeError == .deadlineExceeded ? .writeTimedOut : .writeFailed
+        } else if let processorError = error as? BLEMessageProcessorError {
+            switch processorError {
+            case .responseTimeout:
+                failure = .adapterResponseTimedOut
+            case .staleRequestToken:
+                failure = .disconnected
+            case .characteristicNotWritable, .writeOperationFailed:
+                failure = .writeFailed
+            case .invalidResponseData:
+                failure = .transportUnavailable
+            }
+        } else if let managerError = error as? BLEManagerError {
+            switch managerError {
+            case let .adapterProfileResolution(resolution):
+                switch resolution {
+                case .ambiguousProfiles, .ambiguousCharacteristic, .ambiguousServices,
+                     .ambiguousInferredCharacteristics:
+                    failure = .ambiguousGATT
+                default:
+                    failure = .unsupportedGATT
+                }
+            case .adapterIdentificationRejected:
+                failure = .adapterIdentificationRejected
+            case .adapterConfigurationRejected:
+                failure = .adapterConfigurationRejected
+            case .notificationSubscriptionFailed:
+                failure = .notificationSubscriptionFailed
+            case .sendMessageTimeout, .timeout:
+                failure = .adapterResponseTimedOut
+            case .peripheralNotConnected:
+                failure = .disconnected
+            default:
+                failure = .transportUnavailable
+            }
+        } else {
+            failure = .transportUnavailable
+        }
+        let currentSubscription = compatibilityLock.withLock {
+            compatibilityReportStorage?.subscription ?? .notRequested
+        }
+        publishCompatibilityReport(
+            stage: .failed,
+            subscription: failure == .notificationSubscriptionFailed ? .failed : currentSubscription,
+            failure: failure,
+            attempt: attempt
+        )
+    }
+
+    /// Maps only terminal command-channel failures. Vehicle-level outcomes such
+    /// as `NO DATA` remain available to the caller without replacing a valid
+    /// adapter compatibility report.
+    static func commandCompatibilityFailure(for error: Error) -> BLECompatibilityFailure? {
+        if error is CancellationError {
+            return .cancelled
+        }
+        if let writeError = error as? BLEWriteCoordinatorError {
+            return writeError == .deadlineExceeded ? .writeTimedOut : .writeFailed
+        }
+        if let processorError = error as? BLEMessageProcessorError {
+            switch processorError {
+            case .responseTimeout:
+                return .adapterResponseTimedOut
+            case .staleRequestToken:
+                return .disconnected
+            case .characteristicNotWritable, .writeOperationFailed:
+                return .writeFailed
+            case .invalidResponseData:
+                return nil
+            }
+        }
+        if let managerError = error as? BLEManagerError {
+            switch managerError {
+            case .peripheralNotConnected, .missingPeripheralOrCharacteristic:
+                return .disconnected
+            case .sendMessageTimeout, .timeout:
+                return .adapterResponseTimedOut
+            case .notificationSubscriptionFailed:
+                return .notificationSubscriptionFailed
+            case .noData, .adapterIdentificationRejected, .adapterConfigurationRejected,
+                 .adapterProfileResolution:
+                return nil
+            default:
+                return .transportUnavailable
+            }
+        }
+        return nil
+    }
+
+    private func publishCommandFailure(_ error: Error, attempt: UInt64) {
+        guard let failure = Self.commandCompatibilityFailure(for: error) else { return }
+        compatibilityLock.withLock {
+            guard activeCompatibilityAttempt == attempt,
+                  compatibilityAttemptFence.isCurrent(attempt) else { return }
+            // A pending command is failed when the channel is torn down. Keep
+            // the earlier, more specific terminal cause (for example lost
+            // notifications) instead of replacing it with generic disconnect.
+            if compatibilityReportStorage?.stage == .failed,
+               compatibilityReportStorage?.failure != nil {
+                return
+            }
+            let binding = preparedPeripheralAttempt == attempt
+                ? peripheralManager.resolutionSnapshot()?.binding
+                : nil
+            let report = BLECompatibilityReport(
+                binding: binding,
+                stage: .failed,
+                subscription: failure == .notificationSubscriptionFailed
+                    ? .failed
+                    : compatibilityReportStorage?.subscription ?? .notRequested,
+                failure: failure
+            )
+            compatibilityReportStorage = report
+            compatibilitySubject.send(report)
+        }
+    }
+
+    private func isCurrentCompatibilityAttempt(_ attempt: UInt64) -> Bool {
+        compatibilityLock.withLock {
+            activeCompatibilityAttempt == attempt
+                && compatibilityAttemptFence.isCurrent(attempt)
+        }
+    }
+
+    static func callbackOwnership(
+        preparedAttempt: UInt64?,
+        activeAttempt: UInt64,
+        preservedCleanupAttempt: UInt64?
+    ) -> CompatibilityCallbackOwnership {
+        if preparedAttempt == activeAttempt { return .current }
+        if preservedCleanupAttempt == activeAttempt { return .expectedCleanup }
+        return .stale
+    }
+
+    private func callbackOwnership() -> CompatibilityCallbackOwnership {
+        compatibilityLock.withLock {
+            Self.callbackOwnership(
+                preparedAttempt: preparedPeripheralAttempt,
+                activeAttempt: activeCompatibilityAttempt,
+                preservedCleanupAttempt: compatibilityAttemptPreservedDuringReset
+            )
+        }
+    }
+
+    static func shouldProcessConnectTimeout(
+        capturedAttempt: UInt64,
+        activeAttempt: UInt64,
+        preparedAttempt: UInt64?,
+        fenceIsCurrent: Bool,
+        isConnecting: Bool,
+        matchesPeripheral: Bool
+    ) -> Bool {
+        capturedAttempt == activeAttempt
+            && preparedAttempt == capturedAttempt
+            && fenceIsCurrent
+            && isConnecting
+            && matchesPeripheral
+    }
+
+    func recordAdapterInitializationStarted(expectedAttempt attempt: UInt64) {
+        publishCompatibilityReport(
+            stage: .adapterConfiguration,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+    }
+
+    func recordAdapterInitialized(expectedAttempt attempt: UInt64) {
+        let didRecord = compatibilityLock.withLock { () -> Bool in
+            guard activeCompatibilityAttempt == attempt,
+                  compatibilityAttemptFence.isCurrent(attempt),
+                  let snapshot = peripheralManager.resolutionSnapshot() else { return false }
+            if snapshot.binding.source == .known {
+                _ = bindingCache.storeInitializedKnownBinding(
+                    snapshot.binding,
+                    forPeripheralID: snapshot.peripheralID,
+                    fingerprint: snapshot.fingerprint
+                )
+            }
+            return true
+        }
+        guard didRecord else { return }
+        publishCompatibilityReport(
+            stage: .adapterValidated,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+    }
+
+    func recordVehicleProbeStarted(expectedAttempt attempt: UInt64) {
+        publishCompatibilityReport(
+            stage: .vehicleProbe,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+    }
+
+    func recordVehicleValidated(expectedAttempt attempt: UInt64) {
+        publishCompatibilityReport(
+            stage: .compatible,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+    }
+
+    func recordVehicleUnavailable(expectedAttempt attempt: UInt64) {
+        publishCompatibilityReport(
+            stage: .adapterValidated,
+            subscription: .confirmed,
+            failure: .vehicleECUUnavailable,
+            attempt: attempt
+        )
+    }
+
+    func recordFailure(
+        _ failure: BLECompatibilityFailure,
+        stage: BLECompatibilityStage,
+        subscription: BLESubscriptionStatus,
+        expectedAttempt attempt: UInt64
+    ) {
+        publishCompatibilityReport(
+            stage: stage,
+            subscription: subscription,
+            failure: failure,
+            attempt: attempt
+        )
+    }
+
+    func recordDisconnected() {
+        compatibilityLock.withLock {
+            let attempt = compatibilityAttemptFence.begin()
+            channelValidationTask?.cancel()
+            channelValidationTask = nil
+            channelValidationAttempt = nil
+            activeCompatibilityAttempt = attempt
+            let previous = compatibilityReportStorage
+            let report = Self.compatibilityReportAfterDisconnect(previous)
+            compatibilityReportStorage = report
+            compatibilitySubject.send(report)
+        }
+    }
+
+    /// Cleanup after a terminal failure must retain the actionable cause. A
+    /// normal disconnect from a nonfailed session records generic link loss.
+    static func compatibilityReportAfterDisconnect(
+        _ previous: BLECompatibilityReport?
+    ) -> BLECompatibilityReport {
+        if let previous, previous.stage == .failed, previous.failure != nil {
+            return previous
+        }
+        return BLECompatibilityReport(
+            profileID: previous?.profileID,
+            profileVersion: previous?.profileVersion,
+            source: previous?.source,
+            stage: .disconnected,
+            subscription: .notRequested,
+            failure: .disconnected
+        )
     }
 
     // MARK: - Central Manager Control Methods
@@ -179,7 +520,12 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         case .poweredOff:
             obdWarning("Bluetooth powered off", category: .bluetooth)
             disconnectWasRequested = false
-            peripheralManager.connectedPeripheral = nil
+            recordDisconnected()
+            peripheralManager.failCurrentSetup(BLEManagerError.peripheralNotConnected)
+            if let peripheral = peripheralManager.connectedPeripheral {
+                peripheralManager.confirmedDisconnect(peripheral)
+            }
+            peripheralManager.reset()
             let oldState = connectionState
             connectionState = .disconnected
             OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
@@ -229,17 +575,37 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         peripheralSubject.send(peripheral)
     }
 
-    func connect(to peripheral: CBPeripheral) {
+    @discardableResult
+    func connect(
+        to peripheral: CBPeripheral,
+        scope requestedScope: BLEPeripheralManager.DiscoveryScope? = nil,
+        compatibilityAttempt requestedAttempt: UInt64? = nil
+    ) -> UInt64 {
+        let compatibilityAttempt = requestedAttempt ?? beginCompatibilityAttempt()
+        guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else {
+            return compatibilityAttempt
+        }
         guard centralManager.state == .poweredOn else {
             obdWarning("Ignoring connect request while Bluetooth is not powered on", category: .bluetooth)
-            return
+            publishCompatibilityFailure(BLEManagerError.peripheralNotConnected, attempt: compatibilityAttempt)
+            return compatibilityAttempt
         }
+
+        let scope = requestedScope ?? (
+            bindingCache.hasCurrentValidatedRecord(forPeripheralID: peripheral.identifier.uuidString)
+                ? .validatedCacheHint
+                : .knownProfilesOnly
+        )
 
         let peripheralName = peripheral.name ?? "Unnamed"
         obdInfo("Attempting connection to peripheral: \(peripheralName)", category: .bluetooth)
 
         lastConnectedPeripheralUUID = peripheral.identifier
-        peripheralManager.setPeripheral(peripheral, discoverServices: false)
+        peripheralManager.prepareConnection(peripheral, scope: scope)
+        compatibilityLock.withLock {
+            guard activeCompatibilityAttempt == compatibilityAttempt else { return }
+            preparedPeripheralAttempt = compatibilityAttempt
+        }
         
         let oldState = connectionState
         connectionState = .connecting
@@ -250,27 +616,61 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
         
         centralManager.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
-        scheduleConnectTimeout(for: peripheral)
+        scheduleConnectTimeout(for: peripheral, attempt: compatibilityAttempt)
         if centralManager.isScanning {
             centralManager.stopScan()
         }
+        return compatibilityAttempt
     }
 
     func didConnect(_: CBCentralManager, peripheral: CBPeripheral) {
+        compatibilityLock.lock()
+        defer { compatibilityLock.unlock() }
+        guard peripheralManager.connectedPeripheral === peripheral else {
+            obdDebug("Ignoring connect callback for a superseded peripheral", category: .bluetooth)
+            return
+        }
+        guard callbackOwnership() == .current else {
+            obdDebug("Ignoring connect callback for a noncurrent compatibility attempt", category: .bluetooth)
+            return
+        }
         obdInfo("Connected to peripheral: \(peripheral.name ?? "Unnamed")", category: .bluetooth)
         disconnectWasRequested = false
         cancelConnectTimeout()
         reconnectAttempts = 0 // Reset on successful connection
         lastConnectedPeripheralUUID = peripheral.identifier
-        peripheralManager.setPeripheral(peripheral, discoverServices: true)
+        peripheralManager.startServiceDiscovery(on: peripheral)
         // Note: connectionState will be set to .connectedToAdapter in peripheralManager delegate
     }
 
     func didFailToConnect(_: CBCentralManager, peripheral: CBPeripheral, error: Error?) {
+        compatibilityLock.lock()
+        defer { compatibilityLock.unlock() }
+        guard peripheralManager.connectedPeripheral === peripheral else {
+            obdDebug("Ignoring failed-connect callback for a superseded peripheral", category: .bluetooth)
+            return
+        }
+        switch callbackOwnership() {
+        case .expectedCleanup:
+            let preservedAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+            cancelConnectTimeout()
+            disconnectWasRequested = false
+            resetAllState(preservingCompatibilityAttempt: preservedAttempt)
+            return
+        case .stale:
+            obdDebug("Ignoring failed-connect callback for a noncurrent compatibility attempt", category: .bluetooth)
+            return
+        case .current:
+            break
+        }
         let peripheralName = peripheral.name ?? "Unnamed"
         let errorMsg = error?.localizedDescription ?? "Unknown error"
         obdError("Connection failed to peripheral: \(peripheralName) - \(errorMsg)", category: .bluetooth)
         cancelConnectTimeout()
+        let attempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        let failure = error ?? BLEManagerError.unknownError
+        peripheralManager.failCurrentSetup(failure)
+        publishCompatibilityFailure(failure, attempt: attempt)
         
         let oldState = connectionState
         connectionState = .error
@@ -282,6 +682,18 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     }
 
     func didDisconnect(_: CBCentralManager, peripheral: CBPeripheral, error: Error?) {
+        compatibilityLock.lock()
+        defer { compatibilityLock.unlock() }
+        guard peripheralManager.connectedPeripheral === peripheral else {
+            obdDebug("Ignoring disconnect callback for a superseded peripheral", category: .bluetooth)
+            return
+        }
+        let ownership = callbackOwnership()
+        guard ownership == .current || ownership == .expectedCleanup else {
+            obdDebug("Ignoring disconnect callback for a noncurrent compatibility attempt", category: .bluetooth)
+            return
+        }
+        peripheralManager.confirmedDisconnect(peripheral)
         let peripheralName = peripheral.name ?? "Unnamed"
         let wasUnexpected = error != nil
         let wasRequested = disconnectWasRequested
@@ -378,7 +790,13 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
 
         obdInfo("Arming standing reconnect to \(peripheral.name ?? uuid.uuidString) — pending connect with no timeout", category: .bluetooth)
-        peripheralManager.setPeripheral(peripheral, discoverServices: false)
+        let compatibilityAttempt = beginCompatibilityAttempt()
+        let scope: BLEPeripheralManager.DiscoveryScope =
+            bindingCache.hasCurrentValidatedRecord(forPeripheralID: peripheral.identifier.uuidString)
+                ? .validatedCacheHint
+                : .knownProfilesOnly
+        peripheralManager.prepareConnection(peripheral, scope: scope)
+        compatibilityLock.withLock { preparedPeripheralAttempt = compatibilityAttempt }
         // Deliberately no scheduleConnectTimeout and no .connecting state:
         // the request waits silently at the OS level until the adapter appears.
         centralManager.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
@@ -395,7 +813,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             if peripheral.state == .connected {
                 // Peripheral still connected - rediscover and wait for the
                 // notification subscription before publishing adapter readiness.
-                peripheralManager.setPeripheral(peripheral, discoverServices: true)
+                let scope: BLEPeripheralManager.DiscoveryScope =
+                    bindingCache.hasCurrentValidatedRecord(forPeripheralID: peripheral.identifier.uuidString)
+                        ? .validatedCacheHint
+                        : .knownProfilesOnly
+                let compatibilityAttempt = beginCompatibilityAttempt()
+                peripheralManager.prepareConnection(peripheral, scope: scope)
+                compatibilityLock.withLock { preparedPeripheralAttempt = compatibilityAttempt }
+                peripheralManager.startServiceDiscovery(on: peripheral)
                 cancelConnectTimeout()
                 obdInfo("Restored connected peripheral; validating adapter channel", category: .bluetooth)
             } else if peripheral.state == .connecting {
@@ -403,7 +828,13 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 // reconnect). Leave it pending with no timeout — iOS completes
                 // it when the adapter powers on. State stays .disconnected so
                 // the app treats the standing request as invisible.
-                peripheralManager.setPeripheral(peripheral, discoverServices: false)
+                let scope: BLEPeripheralManager.DiscoveryScope =
+                    bindingCache.hasCurrentValidatedRecord(forPeripheralID: peripheral.identifier.uuidString)
+                        ? .validatedCacheHint
+                        : .knownProfilesOnly
+                let compatibilityAttempt = beginCompatibilityAttempt()
+                peripheralManager.prepareConnection(peripheral, scope: scope)
+                compatibilityLock.withLock { preparedPeripheralAttempt = compatibilityAttempt }
                 connectionState = .disconnected
                 obdInfo("Restored pending peripheral connection — leaving it standing", category: .bluetooth)
             } else {
@@ -451,47 +882,274 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     // MARK: - Async Methods
 
     func connectAsync(timeout: TimeInterval, peripheral: CBPeripheral? = nil) async throws {
-        try await waitForPoweredOn()
+        let compatibilityAttempt = beginCompatibilityAttempt()
+        do {
+            try await waitForPoweredOn()
+            guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else {
+                throw CancellationError()
+            }
 
-        // ALWAYS disconnect and reset before any new connection attempt
-        // This handles stale state after force quit, timeouts, or partial connections
-        // Never skip cleanup even for the same peripheral - stale BLE state causes
-        // corrupted communication after reconnection
-        if connectionState != .disconnected || peripheralManager.connectedPeripheral != nil {
-            obdInfo("Resetting connection state before new connection", category: .bluetooth)
-            _ = await disconnectPeripheralAsync()
-            resetAllState()
-            // Brief delay for reliable Bluetooth cleanup
-            try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+            // ALWAYS disconnect and reset before any new connection attempt.
+            if connectionState != .disconnected || peripheralManager.connectedPeripheral != nil {
+                obdInfo("Resetting connection state before new connection", category: .bluetooth)
+                compatibilityLock.withLock {
+                    compatibilityAttemptPreservedDuringReset = compatibilityAttempt
+                }
+                _ = await disconnectPeripheralAsync()
+                compatibilityLock.withLock {
+                    if compatibilityAttemptPreservedDuringReset == compatibilityAttempt {
+                        compatibilityAttemptPreservedDuringReset = nil
+                    }
+                }
+                guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else {
+                    throw CancellationError()
+                }
+                resetAllState(preservingCompatibilityAttempt: compatibilityAttempt)
+                try await Task.sleep(nanoseconds: 300_000_000)
+            }
+
+            let targetPeripheral: CBPeripheral
+            if let peripheral {
+                targetPeripheral = peripheral
+            } else {
+                startScanning(peripheralScanner.supportedServices)
+                targetPeripheral = try await peripheralScanner.waitForFirstPeripheral(timeout: timeout)
+            }
+            guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else {
+                throw CancellationError()
+            }
+
+            let scope: BLEPeripheralManager.DiscoveryScope = peripheral == nil
+                ? .knownProfilesOnly
+                : .explicitSelection
+            _ = connect(
+                to: targetPeripheral,
+                scope: scope,
+                compatibilityAttempt: compatibilityAttempt
+            )
+            guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else {
+                throw CancellationError()
+            }
+            try await peripheralManager.waitForCharacteristicsSetup(timeout: timeout)
+            guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else {
+                throw CancellationError()
+            }
+            try await awaitChannelValidation(attempt: compatibilityAttempt)
+        } catch {
+            publishCompatibilityFailure(error, attempt: compatibilityAttempt)
+            throw error
         }
-
-        let targetPeripheral: CBPeripheral
-        if let peripheral = peripheral {
-            targetPeripheral = peripheral
-        } else {
-            startScanning(peripheralScanner.supportedServices)
-            targetPeripheral = try await peripheralScanner.waitForFirstPeripheral(timeout: timeout)
-        }
-
-        connect(to: targetPeripheral)
-
-        try await peripheralManager.waitForCharacteristicsSetup(timeout: timeout)
-
-        // Clear any stale data from connection handshake
-        messageProcessor.reset()
     }
 
-    func peripheralManager(_ manager: BLEPeripheralManager, didSetupCharacteristics peripheral: CBPeripheral) {
+    private func validateInferredChannelIfNeeded(attempt: UInt64) async throws {
+        guard let snapshot = peripheralManager.resolutionSnapshot(),
+              snapshot.binding.source == .inferred else { return }
+
+        var validation = BLEAdapterValidationState()
+        publishCompatibilityReport(
+            stage: .adapterIdentification,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+        let identityResponse = try await sendCommand(
+            BLEAdapterValidationCommand.identifyAdapter.rawValue,
+            retries: 1
+        )
+        guard compatibilityAttemptFence.isCurrent(attempt) else { throw CancellationError() }
+        validation.receive(identityResponse)
+        guard validation.stage == .awaitingEchoDisable else {
+            throw BLEManagerError.adapterIdentificationRejected
+        }
+
+        publishCompatibilityReport(
+            stage: .adapterConfiguration,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+        let configurationResponse = try await sendCommand(
+            BLEAdapterValidationCommand.disableEcho.rawValue,
+            retries: 1
+        )
+        guard compatibilityAttemptFence.isCurrent(attempt) else { throw CancellationError() }
+        validation.receive(configurationResponse)
+        guard validation.isAdapterValidated else {
+            throw BLEManagerError.adapterConfigurationRejected
+        }
+
+        let didRecord = compatibilityLock.withLock { () -> Bool in
+            guard activeCompatibilityAttempt == attempt,
+                  compatibilityAttemptFence.isCurrent(attempt),
+                  let current = peripheralManager.resolutionSnapshot(),
+                  current.generation == snapshot.generation,
+                  current.peripheralID == snapshot.peripheralID,
+                  current.fingerprint == snapshot.fingerprint else { return false }
+            return bindingCache.storeValidatedBinding(
+                current.binding,
+                forPeripheralID: current.peripheralID,
+                fingerprint: current.fingerprint,
+                validation: validation
+            )
+        }
+        guard didRecord else { throw CancellationError() }
+        publishCompatibilityReport(
+            stage: .adapterValidated,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+    }
+
+    private func awaitChannelValidation(attempt: UInt64) async throws {
+        startChannelValidationIfNeeded(attempt: attempt)
+        let task = compatibilityLock.withLock { () -> Task<Void, Error>? in
+            guard channelValidationAttempt == attempt else { return nil }
+            return channelValidationTask
+        }
+        if let task {
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await task.value
+                try Task.checkCancellation()
+            } onCancel: {
+                self.compatibilityLock.withLock {
+                    guard self.activeCompatibilityAttempt == attempt,
+                          self.channelValidationAttempt == attempt else { return }
+                    self.channelValidationTask?.cancel()
+                }
+            }
+        } else {
+            try Task.checkCancellation()
+            guard compatibilityAttemptFence.isCurrent(attempt) else {
+                throw CancellationError()
+            }
+        }
+    }
+
+    private func startChannelValidationIfNeeded(attempt: UInt64) {
+        guard compatibilityAttemptFence.isCurrent(attempt),
+              let binding = peripheralManager.resolutionSnapshot()?.binding else { return }
+
+        let shouldStartKnown = compatibilityLock.withLock { () -> Bool in
+            guard activeCompatibilityAttempt == attempt,
+                  channelValidationAttempt != attempt else { return false }
+            channelValidationAttempt = attempt
+            guard binding.source == .inferred else { return true }
+            channelValidationTask = Task { [weak self] in
+                guard let self else { throw CancellationError() }
+                self.messageProcessor.reset()
+                self.publishCompatibilityReport(
+                    stage: .gattResolved,
+                    subscription: .confirmed,
+                    attempt: attempt
+                )
+                do {
+                    try await self.validateInferredChannelIfNeeded(attempt: attempt)
+                    guard self.compatibilityAttemptFence.isCurrent(attempt) else {
+                        throw CancellationError()
+                    }
+                    self.publishConnectedToAdapter(attempt: attempt)
+                } catch {
+                    self.publishCompatibilityFailure(error, attempt: attempt)
+                    if self.compatibilityAttemptFence.isCurrent(attempt) {
+                        let oldState = self.connectionState
+                        self.connectionState = .error
+                        OBDLogger.shared.logConnectionChange(from: oldState, to: .error)
+                    }
+                    throw error
+                }
+            }
+            return false
+        }
+        guard shouldStartKnown else { return }
+        messageProcessor.reset()
+        publishCompatibilityReport(
+            stage: .gattResolved,
+            subscription: .confirmed,
+            attempt: attempt
+        )
+        publishConnectedToAdapter(attempt: attempt)
+    }
+
+    private func publishConnectedToAdapter(attempt: UInt64) {
+        guard compatibilityAttemptFence.isCurrent(attempt) else { return }
         let oldState = connectionState
         connectionState = .connectedToAdapter
         OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
-        
-        // Dispatch delegate call to main queue since it might update UI
         DispatchQueue.main.async {
+            guard self.compatibilityAttemptFence.isCurrent(attempt) else { return }
             self.obdDelegate?.connectionStateChanged(state: .connectedToAdapter)
         }
-        
-        obdInfo("Characteristics setup complete, connected to adapter", category: .bluetooth)
+        obdInfo("Validated adapter channel is ready", category: .bluetooth)
+    }
+
+    func peripheralManager(
+        _ manager: BLEPeripheralManager,
+        didSetupCharacteristics peripheral: CBPeripheral,
+        token: BLESetupToken
+    ) {
+        let attempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        guard manager.matchesCurrentSetup(token: token, peripheral: peripheral) else { return }
+        startChannelValidationIfNeeded(attempt: attempt)
+    }
+
+    func peripheralManager(
+        _ manager: BLEPeripheralManager,
+        didResolve _: BLEAdapterBinding,
+        token: BLESetupToken,
+        peripheral: CBPeripheral
+    ) {
+        let attempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        let isPreparedAttempt = compatibilityLock.withLock {
+            preparedPeripheralAttempt == attempt
+        }
+        guard isPreparedAttempt,
+              manager.matchesCurrentSetup(token: token, peripheral: peripheral),
+              manager.connectedPeripheral === peripheral else { return }
+        publishCompatibilityReport(
+            stage: .subscription,
+            subscription: .pending,
+            attempt: attempt
+        )
+    }
+
+    func peripheralManager(
+        _ manager: BLEPeripheralManager,
+        didLoseNotificationSubscription error: Error,
+        token: BLESetupToken,
+        peripheral: CBPeripheral
+    ) {
+        compatibilityLock.lock()
+        defer { compatibilityLock.unlock() }
+        let attempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        let ownsAttempt = compatibilityLock.withLock {
+            preparedPeripheralAttempt == attempt
+                && compatibilityAttemptFence.isCurrent(attempt)
+        }
+        guard ownsAttempt,
+              manager.matchesCurrentSetup(token: token, peripheral: peripheral) else { return }
+
+        obdError("Adapter notification subscription was lost: \(error.localizedDescription)", category: .bluetooth)
+        publishCompatibilityReport(
+            stage: .failed,
+            subscription: .failed,
+            failure: .notificationSubscriptionFailed,
+            attempt: attempt
+        )
+        let oldState = connectionState
+        connectionState = .error
+        OBDLogger.shared.logConnectionChange(from: oldState, to: .error)
+        DispatchQueue.main.async {
+            guard self.compatibilityAttemptFence.isCurrent(attempt) else { return }
+            self.obdDelegate?.connectionStateChanged(state: .error)
+        }
+
+        guard centralManager.state == .poweredOn,
+              peripheral.state != .disconnected else {
+            resetAllState()
+            return
+        }
+        // Keep `disconnectWasRequested` unchanged so a concurrent user-requested
+        // disconnect stays user-owned; otherwise normal recovery policy applies.
+        centralManager.cancelPeripheralConnection(peripheral)
     }
 
     func waitForPoweredOn() async throws {
@@ -531,10 +1189,23 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Serialized by `commandSemaphore` — only one command is in-flight at a time.
     /// Uses a deterministic 3-step protocol: `beginRequest()` → BLE write → `awaitResponse()`.
     func sendCommand(_ command: String, retries: Int = 3) async throws -> [String] {
+        let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
         let acquired = await commandSemaphore.wait()
-        guard acquired else { throw CancellationError() }
+        guard acquired else {
+            let error = CancellationError()
+            publishCommandFailure(error, attempt: compatibilityAttempt)
+            throw error
+        }
         defer { commandSemaphore.signal() }
-        return try await sendCommandLocked(command, retries: retries)
+        do {
+            guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
+                throw CancellationError()
+            }
+            return try await sendCommandLocked(command, retries: retries)
+        } catch {
+            publishCommandFailure(error, attempt: compatibilityAttempt)
+            throw error
+        }
     }
 
     /// The write-and-await body of `sendCommand`, with the command mutex **already held**.
@@ -546,6 +1217,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         try Task.checkCancellation()
 
         for attempt in 1...retries {
+            try Task.checkCancellation()
             // Validate peripheral per attempt (connection may drop between retries)
             guard let peripheral = peripheralManager.connectedPeripheral else {
                 obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
@@ -554,13 +1226,25 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
             do {
                 let token = messageProcessor.beginRequest()
-                try characteristicHandler.writeCommand(command, to: peripheral)
+                do {
+                    try await characteristicHandler.writeCommand(command, to: peripheral)
+                } catch {
+                    // The response slot was armed before the first chunk so an
+                    // early adapter response cannot be lost. A failed/cancelled
+                    // write must invalidate that slot before any late bytes arrive.
+                    messageProcessor.reset()
+                    throw error
+                }
                 let response = try await messageProcessor.awaitResponse(for: token, timeout: BLEConstants.defaultTimeout)
                 obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
                 return response
             } catch {
                 // Non-retryable errors — exit immediately
                 if error is CancellationError { throw error }
+                // A write coordinator error may follow one or more submitted
+                // chunks. Retrying the command would duplicate an unknown prefix.
+                if error is BLEWriteCoordinatorError { throw error }
+                if error is BLECommandEncodingError { throw error }
                 if let processorError = error as? BLEMessageProcessorError,
                    processorError == .staleRequestToken { throw error }
                 if attempt == retries {
@@ -569,7 +1253,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 }
                 obdDebug("Attempt \(attempt)/\(retries) failed for \(command): \(error.localizedDescription), retrying...", category: .communication)
                 messageProcessor.reset()
-                try? await Task.sleep(nanoseconds: UInt64(BLEConstants.retryDelay * 1_000_000_000))
+                try await Task.sleep(nanoseconds: UInt64(BLEConstants.retryDelay * 1_000_000_000))
             }
         }
         throw BLEManagerError.noData
@@ -593,50 +1277,66 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         shouldContinueListening: @escaping @Sendable ([String]) -> Bool,
         listenDeadline: TimeInterval
     ) async throws -> [String] {
+        let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
         let acquired = await commandSemaphore.wait()
-        guard acquired else { throw CancellationError() }
+        guard acquired else {
+            let error = CancellationError()
+            publishCommandFailure(error, attempt: compatibilityAttempt)
+            throw error
+        }
         defer { commandSemaphore.signal() }
 
-        var accumulated = try await sendCommandLocked(command, retries: retries)
-        let started = Date()
-
-        while shouldContinueListening(accumulated) {
-            try Task.checkCancellation()
-            let remaining = listenDeadline - Date().timeIntervalSince(started)
-            guard remaining > 0 else {
-                obdDebug("Extra listen budget exhausted for \(command)", category: .communication)
-                break
-            }
-            guard peripheralManager.connectedPeripheral != nil else {
-                throw BLEManagerError.peripheralNotConnected
-            }
-
-            let token = messageProcessor.beginContinuationRequest()
-            do {
-                let response = try await messageProcessor.awaitResponse(
-                    for: token,
-                    timeout: min(remaining, BLEConstants.defaultTimeout)
-                )
-                obdDebug("Extra listen window delivered: \(response.joined(separator: " | "))", category: .communication)
-                accumulated.append(contentsOf: response)
-            } catch is CancellationError {
+        do {
+            guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
                 throw CancellationError()
-            } catch let error as BLEMessageProcessorError where error == .staleRequestToken {
-                throw error // the processor was reset under us: a disconnect, not a quiet ECU
-            } catch let error as BLEManagerError {
-                // `NO DATA` in a listen window means nothing more came; anything else (peripheral
-                // gone, unauthorized, …) is terminal and must never read as silence.
-                if case .noData = error { break }
-                throw error
-            } catch {
-                obdDebug(
-                    "Extra listen window ended with no response: \(error.localizedDescription)",
-                    category: .communication
-                )
-                break
             }
+            var accumulated = try await sendCommandLocked(command, retries: retries)
+            let started = Date()
+
+            while shouldContinueListening(accumulated) {
+                try Task.checkCancellation()
+                guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
+                    throw CancellationError()
+                }
+                let remaining = listenDeadline - Date().timeIntervalSince(started)
+                guard remaining > 0 else {
+                    obdDebug("Extra listen budget exhausted for \(command)", category: .communication)
+                    break
+                }
+                guard peripheralManager.connectedPeripheral != nil else {
+                    throw BLEManagerError.peripheralNotConnected
+                }
+
+                let token = messageProcessor.beginContinuationRequest()
+                do {
+                    let response = try await messageProcessor.awaitResponse(
+                        for: token,
+                        timeout: min(remaining, BLEConstants.defaultTimeout)
+                    )
+                    obdDebug("Extra listen window delivered: \(response.joined(separator: " | "))", category: .communication)
+                    accumulated.append(contentsOf: response)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as BLEMessageProcessorError where error == .staleRequestToken {
+                    throw error // the processor was reset under us: a disconnect, not a quiet ECU
+                } catch let error as BLEManagerError {
+                    // `NO DATA` in a listen window means nothing more came; anything else (peripheral
+                    // gone, unauthorized, …) is terminal and must never read as silence.
+                    if case .noData = error { break }
+                    throw error
+                } catch {
+                    obdDebug(
+                        "Extra listen window ended with no response: \(error.localizedDescription)",
+                        category: .communication
+                    )
+                    break
+                }
+            }
+            return accumulated
+        } catch {
+            publishCommandFailure(error, attempt: compatibilityAttempt)
+            throw error
         }
-        return accumulated
     }
 
     func scanForPeripherals() async throws {
@@ -696,8 +1396,18 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     /// Complete reset of all BLE state for reconnection
     /// Call this AFTER disconnection is confirmed
-    public func resetAllState() {
+    public func resetAllState(preservingCompatibilityAttempt: UInt64? = nil) {
         cancelConnectTimeout()
+        let preservedAttempt = preservingCompatibilityAttempt ?? compatibilityLock.withLock {
+            compatibilityAttemptPreservedDuringReset
+        }
+        let currentAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        if BLECompatibilityResetPolicy.shouldRecordDisconnected(
+            preservedAttempt: preservedAttempt,
+            currentAttempt: currentAttempt
+        ) {
+            recordDisconnected()
+        }
         let oldState = connectionState
 
         // Reset characteristic handler with notification unsubscription
@@ -736,36 +1446,42 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         connectTimeoutTask = nil
     }
 
-    private func scheduleConnectTimeout(for peripheral: CBPeripheral) {
+    private func scheduleConnectTimeout(for peripheral: CBPeripheral, attempt: UInt64? = nil) {
         cancelConnectTimeout()
 
         let timeout = BLEConstants.connectionTimeout + 2.0
-        let targetIdentifier = peripheral.identifier
+        let capturedAttempt = attempt ?? compatibilityLock.withLock { activeCompatibilityAttempt }
 
         connectTimeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
 
-            guard self.connectionState == .connecting,
-                  self.peripheralManager.connectedPeripheral?.identifier == targetIdentifier else {
-                return
+            self.compatibilityLock.withLock {
+                guard Self.shouldProcessConnectTimeout(
+                    capturedAttempt: capturedAttempt,
+                    activeAttempt: self.activeCompatibilityAttempt,
+                    preparedAttempt: self.preparedPeripheralAttempt,
+                    fenceIsCurrent: self.compatibilityAttemptFence.isCurrent(capturedAttempt),
+                    isConnecting: self.connectionState == .connecting,
+                    matchesPeripheral: self.peripheralManager.connectedPeripheral === peripheral
+                ) else { return }
+
+                obdWarning("Connect attempt timed out for peripheral \(peripheral.name ?? peripheral.identifier.uuidString), forcing cleanup", category: .bluetooth)
+
+                if self.centralManager.state == .poweredOn {
+                    self.disconnectWasRequested = true
+                    self.centralManager.cancelPeripheralConnection(peripheral)
+                } else {
+                    obdWarning("Bluetooth not powered on while timing out connect attempt", category: .bluetooth)
+                }
+
+                self.resetAllState()
+
+                // The adapter is unreachable (engine off, out of range). Replace
+                // the cancelled attempt with a standing pending connect so the
+                // next ignition reconnects without any app-side wake signal.
+                self.armStandingReconnect()
             }
-
-            obdWarning("Connect attempt timed out for peripheral \(peripheral.name ?? peripheral.identifier.uuidString), forcing cleanup", category: .bluetooth)
-
-            if self.centralManager.state == .poweredOn {
-                self.disconnectWasRequested = true
-                self.centralManager.cancelPeripheralConnection(peripheral)
-            } else {
-                obdWarning("Bluetooth not powered on while timing out connect attempt", category: .bluetooth)
-            }
-
-            self.resetAllState()
-
-            // The adapter is unreachable (engine off, out of range). Replace
-            // the cancelled attempt with a standing pending connect so the
-            // next ignition reconnects without any app-side wake signal.
-            self.armStandingReconnect()
         }
     }
 
@@ -835,7 +1551,7 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 }
 
-enum BLEManagerError: Error, CustomStringConvertible, LocalizedError {
+enum BLEManagerError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case missingPeripheralOrCharacteristic
     case unknownCharacteristic
     case scanTimeout
@@ -850,6 +1566,11 @@ enum BLEManagerError: Error, CustomStringConvertible, LocalizedError {
     case unknownError
     case unsupported
     case unauthorized
+    case setupWaitAlreadyRegistered
+    case adapterProfileResolution(BLEAdapterProfileResolutionError)
+    case adapterIdentificationRejected
+    case adapterConfigurationRejected
+    case notificationSubscriptionFailed
 
     public var description: String {
         switch self {
@@ -881,6 +1602,16 @@ enum BLEManagerError: Error, CustomStringConvertible, LocalizedError {
             return "Error: Device does not support Bluetooth Low Energy"
         case .unauthorized:
             return "Error: App not authorized to use Bluetooth Low Energy"
+        case .setupWaitAlreadyRegistered:
+            return "Error: Adapter setup is already being awaited"
+        case .adapterProfileResolution:
+            return "Error: Adapter GATT layout is unsupported or ambiguous"
+        case .adapterIdentificationRejected:
+            return "Error: Adapter identification response was not recognized"
+        case .adapterConfigurationRejected:
+            return "Error: Adapter configuration was rejected"
+        case .notificationSubscriptionFailed:
+            return "Error: Adapter notification subscription failed"
         }
     }
 
