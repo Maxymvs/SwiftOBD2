@@ -56,6 +56,37 @@ enum BLEConstants {
     static let pollingInterval: UInt64 = 100_000_000 // 100ms in nanoseconds
 }
 
+/// One-shot ownership for a CoreBluetooth cancellation callback after the
+/// compatibility attempt that initiated the connection has been invalidated.
+/// This state authorizes cleanup only; setup remains fenced by its old token.
+struct BLERequestedTeardownState: Equatable {
+    private(set) var attempt: UInt64?
+    private(set) var shouldRearmStandingReconnect = false
+
+    mutating func begin(attempt: UInt64, ownsPeripheral: Bool, rearmAfterCleanup: Bool) {
+        self.attempt = ownsPeripheral ? attempt : nil
+        shouldRearmStandingReconnect = ownsPeripheral && rearmAfterCleanup
+    }
+
+    mutating func requestStandingReconnect(activeAttempt: UInt64) -> Bool {
+        guard attempt == activeAttempt else { return false }
+        shouldRearmStandingReconnect = true
+        return true
+    }
+
+    mutating func consumeRearm(activeAttempt: UInt64, autoReconnectEnabled: Bool) -> Bool {
+        guard attempt == activeAttempt else { return false }
+        let shouldRearm = shouldRearmStandingReconnect && autoReconnectEnabled
+        clear()
+        return shouldRearm
+    }
+
+    mutating func clear() {
+        attempt = nil
+        shouldRearmStandingReconnect = false
+    }
+}
+
 class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     enum DisconnectRecoveryAction: Equatable {
         case none
@@ -111,6 +142,10 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     private var channelValidationAttempt: UInt64?
     private var compatibilityAttemptPreservedDuringReset: UInt64?
     private var preparedPeripheralAttempt: UInt64?
+    /// Owns the terminal CoreBluetooth callback after an explicit cancellation
+    /// advances the compatibility generation. It never authorizes setup or a
+    /// late didConnect callback for the cancelled attempt.
+    private var requestedTeardown = BLERequestedTeardownState()
 
     var currentCompatibilityReport: BLECompatibilityReport? {
         compatibilityLock.withLock { compatibilityReportStorage }
@@ -175,6 +210,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             channelValidationTask = nil
             channelValidationAttempt = nil
             preparedPeripheralAttempt = nil
+            requestedTeardown.clear()
             activeCompatibilityAttempt = attempt
             return attempt
         }
@@ -345,10 +381,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     static func callbackOwnership(
         preparedAttempt: UInt64?,
         activeAttempt: UInt64,
-        preservedCleanupAttempt: UInt64?
+        preservedCleanupAttempt: UInt64?,
+        requestedTeardownAttempt: UInt64? = nil
     ) -> CompatibilityCallbackOwnership {
         if preparedAttempt == activeAttempt { return .current }
-        if preservedCleanupAttempt == activeAttempt { return .expectedCleanup }
+        if preservedCleanupAttempt == activeAttempt
+            || requestedTeardownAttempt == activeAttempt {
+            return .expectedCleanup
+        }
         return .stale
     }
 
@@ -357,9 +397,24 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             Self.callbackOwnership(
                 preparedAttempt: preparedPeripheralAttempt,
                 activeAttempt: activeCompatibilityAttempt,
-                preservedCleanupAttempt: compatibilityAttemptPreservedDuringReset
+                preservedCleanupAttempt: compatibilityAttemptPreservedDuringReset,
+                requestedTeardownAttempt: requestedTeardown.attempt
             )
         }
+    }
+
+    enum StandingReconnectDisposition: Equatable {
+        case alreadyTracked
+        case adopt
+        case deferUntilTeardown
+    }
+
+    static func standingReconnectDisposition(
+        isOwnedByCurrentAttempt: Bool,
+        disconnectWasRequested: Bool
+    ) -> StandingReconnectDisposition {
+        if disconnectWasRequested { return .deferUntilTeardown }
+        return isOwnedByCurrentAttempt ? .alreadyTracked : .adopt
     }
 
     static func shouldProcessConnectTimeout(
@@ -375,6 +430,15 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             && fenceIsCurrent
             && isConnecting
             && matchesPeripheral
+    }
+
+    static func shouldWaitForDisconnectCleanup(
+        connectionState _: ConnectionState,
+        stillOwnsPeripheral: Bool
+    ) -> Bool {
+        // A standing reconnect is deliberately invisible in connectionState.
+        // Only releasing PM ownership proves its cancellation callback ran.
+        stillOwnsPeripheral
     }
 
     func recordAdapterInitializationStarted(expectedAttempt attempt: UInt64) {
@@ -446,13 +510,32 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         )
     }
 
-    func recordDisconnected() {
+    func recordDisconnected(expectDisconnectCallback: Bool = false) {
+        recordDisconnected(
+            expectDisconnectCallback: expectDisconnectCallback,
+            armStandingReconnectAfterTeardown: false
+        )
+    }
+
+    private func recordDisconnected(
+        expectDisconnectCallback: Bool,
+        armStandingReconnectAfterTeardown: Bool
+    ) {
         compatibilityLock.withLock {
             let attempt = compatibilityAttemptFence.begin()
             channelValidationTask?.cancel()
             channelValidationTask = nil
             channelValidationAttempt = nil
             activeCompatibilityAttempt = attempt
+            let ownsPeripheral = peripheralManager.connectedPeripheral != nil
+            requestedTeardown.begin(
+                attempt: attempt,
+                ownsPeripheral: expectDisconnectCallback && ownsPeripheral,
+                rearmAfterCleanup: armStandingReconnectAfterTeardown
+            )
+            if requestedTeardown.attempt != nil {
+                disconnectWasRequested = true
+            }
             let previous = compatibilityReportStorage
             let report = Self.compatibilityReportAfterDisconnect(previous)
             compatibilityReportStorage = report
@@ -653,9 +736,17 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         switch callbackOwnership() {
         case .expectedCleanup:
             let preservedAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+            let shouldRearm = requestedTeardown.consumeRearm(
+                activeAttempt: preservedAttempt,
+                autoReconnectEnabled: autoReconnectEnabled
+            )
             cancelConnectTimeout()
             disconnectWasRequested = false
+            peripheralManager.confirmedDisconnect(peripheral)
             resetAllState(preservingCompatibilityAttempt: preservedAttempt)
+            if shouldRearm {
+                armStandingReconnect()
+            }
             return
         case .stale:
             obdDebug("Ignoring failed-connect callback for a noncurrent compatibility attempt", category: .bluetooth)
@@ -671,6 +762,16 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         let failure = error ?? BLEManagerError.unknownError
         peripheralManager.failCurrentSetup(failure)
         publishCompatibilityFailure(failure, attempt: attempt)
+
+        // didFailToConnect is terminal for this CoreBluetooth request. Release
+        // PM ownership now so a later public stop cannot wait for a second
+        // callback that CoreBluetooth will never send. Publish first so the
+        // resolved adapter identity remains available in the failure report.
+        peripheralManager.confirmedDisconnect(peripheral)
+        peripheralManager.reset()
+        messageProcessor.reset()
+        requestedTeardown.clear()
+        disconnectWasRequested = false
         
         let oldState = connectionState
         connectionState = .error
@@ -697,6 +798,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         let peripheralName = peripheral.name ?? "Unnamed"
         let wasUnexpected = error != nil
         let wasRequested = disconnectWasRequested
+        let preservedAttempt = ownership == .expectedCleanup ? activeCompatibilityAttempt : nil
+        let shouldRearm = requestedTeardown.consumeRearm(
+            activeAttempt: activeCompatibilityAttempt,
+            autoReconnectEnabled: autoReconnectEnabled
+        )
         disconnectWasRequested = false
         cancelConnectTimeout()
 
@@ -713,7 +819,12 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
 
         // Full reset of all BLE state
-        resetAllState()
+        resetAllState(preservingCompatibilityAttempt: preservedAttempt)
+
+        if shouldRearm {
+            armStandingReconnect()
+            return
+        }
 
         switch disconnectRecoveryAction(hadError: wasUnexpected, wasRequested: wasRequested) {
         case .none:
@@ -770,11 +881,20 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// instant connect/fail loop.
     @discardableResult
     func armStandingReconnect() -> Bool {
+        compatibilityLock.lock()
+        defer { compatibilityLock.unlock() }
         guard autoReconnectEnabled else { return false }
         guard centralManager.state == .poweredOn else {
             obdDebug("Standing reconnect not armed: Bluetooth is not powered on", category: .bluetooth)
             return false
         }
+
+        if requestedTeardown.attempt == activeCompatibilityAttempt {
+            return requestedTeardown.requestStandingReconnect(
+                activeAttempt: activeCompatibilityAttempt
+            )
+        }
+        guard !disconnectWasRequested else { return false }
         guard let uuid = lastConnectedPeripheralUUID,
               let peripheral = centralManager.retrievePeripherals(withIdentifiers: [uuid]).first else {
             obdDebug("Standing reconnect not armed: no saved peripheral in system cache", category: .bluetooth)
@@ -783,8 +903,32 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
         switch peripheral.state {
         case .connected, .connecting:
-            // Already connected or a connect is already pending at the OS level.
-            return true
+            let isOwnedByCurrentAttempt = peripheralManager.connectedPeripheral === peripheral
+                && preparedPeripheralAttempt == activeCompatibilityAttempt
+                && compatibilityAttemptFence.isCurrent(activeCompatibilityAttempt)
+            switch Self.standingReconnectDisposition(
+                isOwnedByCurrentAttempt: isOwnedByCurrentAttempt,
+                disconnectWasRequested: disconnectWasRequested
+            ) {
+            case .alreadyTracked:
+                return true
+            case .deferUntilTeardown:
+                return requestedTeardown.requestStandingReconnect(
+                    activeAttempt: activeCompatibilityAttempt
+                )
+            case .adopt:
+                let compatibilityAttempt = beginCompatibilityAttempt()
+                let scope: BLEPeripheralManager.DiscoveryScope =
+                    bindingCache.hasCurrentValidatedRecord(forPeripheralID: peripheral.identifier.uuidString)
+                        ? .validatedCacheHint
+                        : .knownProfilesOnly
+                peripheralManager.prepareConnection(peripheral, scope: scope)
+                preparedPeripheralAttempt = compatibilityAttempt
+                if peripheral.state == .connected {
+                    peripheralManager.startServiceDiscovery(on: peripheral)
+                }
+                return true
+            }
         default:
             break
         }
@@ -1399,7 +1543,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     public func resetAllState(preservingCompatibilityAttempt: UInt64? = nil) {
         cancelConnectTimeout()
         let preservedAttempt = preservingCompatibilityAttempt ?? compatibilityLock.withLock {
-            compatibilityAttemptPreservedDuringReset
+            compatibilityAttemptPreservedDuringReset ?? requestedTeardown.attempt
         }
         let currentAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
         if BLECompatibilityResetPolicy.shouldRecordDisconnected(
@@ -1426,6 +1570,13 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
         // Reset peripheral manager (clears pending continuations and peripheral reference)
         peripheralManager.reset()
+
+        compatibilityLock.withLock {
+            if requestedTeardown.attempt == currentAttempt {
+                requestedTeardown.clear()
+                disconnectWasRequested = false
+            }
+        }
 
         // Reset connection state with delegate notification
         connectionState = .disconnected
@@ -1469,18 +1620,17 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 obdWarning("Connect attempt timed out for peripheral \(peripheral.name ?? peripheral.identifier.uuidString), forcing cleanup", category: .bluetooth)
 
                 if self.centralManager.state == .poweredOn {
+                    self.peripheralManager.failCurrentSetup(BLEManagerError.peripheralNotConnected)
+                    self.recordDisconnected(
+                        expectDisconnectCallback: true,
+                        armStandingReconnectAfterTeardown: true
+                    )
                     self.disconnectWasRequested = true
                     self.centralManager.cancelPeripheralConnection(peripheral)
                 } else {
                     obdWarning("Bluetooth not powered on while timing out connect attempt", category: .bluetooth)
+                    self.resetAllState()
                 }
-
-                self.resetAllState()
-
-                // The adapter is unreachable (engine off, out of range). Replace
-                // the cancelled attempt with a standing pending connect so the
-                // next ignition reconnects without any app-side wake signal.
-                self.armStandingReconnect()
             }
         }
     }
@@ -1502,9 +1652,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         disconnectWasRequested = true
         centralManager.cancelPeripheralConnection(peripheral)
 
-        // Wait for connectionState to become .disconnected
+        // Silent standing reconnects intentionally keep the public state at
+        // .disconnected. The PM identity is released only by the terminal
+        // CoreBluetooth callback, so it is the reliable completion signal.
         let startTime = Date()
-        while connectionState != .disconnected {
+        while Self.shouldWaitForDisconnectCleanup(
+            connectionState: connectionState,
+            stillOwnsPeripheral: peripheralManager.connectedPeripheral === peripheral
+        ) {
             if Date().timeIntervalSince(startTime) > timeout {
                 obdWarning("Disconnect timed out, forcing state cleanup", category: .bluetooth)
                 // FORCE cleanup on timeout - don't leave in half-connected state

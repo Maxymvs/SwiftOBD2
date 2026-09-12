@@ -83,6 +83,101 @@ final class BLEAdapterValidationTests: XCTestCase {
         )
     }
 
+    func testRequestedDisconnectOwnsCleanupWithoutMakingOldSetupCurrent() {
+        // A connected setup belongs to attempt 3. Explicit stop advances the
+        // public compatibility state to 4 while retaining only teardown
+        // ownership for the CoreBluetooth cancellation callback.
+        let ownership = BLEManager.callbackOwnership(
+            preparedAttempt: 3,
+            activeAttempt: 4,
+            preservedCleanupAttempt: nil,
+            requestedTeardownAttempt: 4
+        )
+        XCTAssertEqual(ownership, .expectedCleanup)
+        XCTAssertNotEqual(ownership, .current)
+
+        // Once a foreground connection supersedes teardown, the same old
+        // callback cannot clean up the new attempt.
+        XCTAssertEqual(
+            BLEManager.callbackOwnership(
+                preparedAttempt: 3,
+                activeAttempt: 5,
+                preservedCleanupAttempt: nil,
+                requestedTeardownAttempt: 4
+            ),
+            .stale
+        )
+    }
+
+    func testStandingReconnectAdoptsUnownedSystemConnectionAndDefersCancellation() {
+        XCTAssertEqual(
+            BLEManager.standingReconnectDisposition(
+                isOwnedByCurrentAttempt: true,
+                disconnectWasRequested: false
+            ),
+            .alreadyTracked
+        )
+        XCTAssertEqual(
+            BLEManager.standingReconnectDisposition(
+                isOwnedByCurrentAttempt: false,
+                disconnectWasRequested: false
+            ),
+            .adopt
+        )
+        XCTAssertEqual(
+            BLEManager.standingReconnectDisposition(
+                isOwnedByCurrentAttempt: false,
+                disconnectWasRequested: true
+            ),
+            .deferUntilTeardown
+        )
+    }
+
+    func testRequestedTeardownThenAutomaticArmRearmsExactlyOnce() {
+        var teardown = BLERequestedTeardownState()
+        teardown.begin(attempt: 9, ownsPeripheral: true, rearmAfterCleanup: false)
+
+        XCTAssertTrue(teardown.requestStandingReconnect(activeAttempt: 9))
+        XCTAssertTrue(teardown.consumeRearm(activeAttempt: 9, autoReconnectEnabled: true))
+        XCTAssertNil(teardown.attempt)
+        XCTAssertFalse(teardown.consumeRearm(activeAttempt: 9, autoReconnectEnabled: true))
+    }
+
+    func testExplicitStopAndNewForegroundAttemptCancelDeferredRearm() {
+        var teardown = BLERequestedTeardownState()
+
+        // Explicit stop owns cleanup but does not request automatic recovery.
+        teardown.begin(attempt: 10, ownsPeripheral: true, rearmAfterCleanup: false)
+        XCTAssertFalse(teardown.consumeRearm(activeAttempt: 10, autoReconnectEnabled: true))
+        XCTAssertNil(teardown.attempt)
+
+        // A new foreground attempt clears an older timeout's deferred rearm.
+        teardown.begin(attempt: 11, ownsPeripheral: true, rearmAfterCleanup: true)
+        teardown.clear()
+        XCTAssertFalse(teardown.consumeRearm(activeAttempt: 11, autoReconnectEnabled: true))
+    }
+
+    func testTerminalConnectFailureDoesNotWaitForAnotherCleanupCallback() {
+        var teardown = BLERequestedTeardownState()
+
+        // didFailToConnect has already confirmed the channel end and released
+        // PM ownership. A subsequent service-level stop therefore retains no
+        // teardown token and cannot defer standing reconnect indefinitely.
+        teardown.begin(attempt: 12, ownsPeripheral: false, rearmAfterCleanup: false)
+        XCTAssertNil(teardown.attempt)
+        XCTAssertFalse(teardown.requestStandingReconnect(activeAttempt: 12))
+    }
+
+    func testStaleCleanupCannotConsumeNewerRequestedTeardown() {
+        var teardown = BLERequestedTeardownState()
+        teardown.begin(attempt: 12, ownsPeripheral: true, rearmAfterCleanup: true)
+
+        XCTAssertFalse(teardown.consumeRearm(activeAttempt: 11, autoReconnectEnabled: true))
+        XCTAssertEqual(teardown.attempt, 12)
+        XCTAssertFalse(teardown.consumeRearm(activeAttempt: 12, autoReconnectEnabled: false))
+        XCTAssertNil(teardown.attempt)
+    }
+
     func testConnectTimeoutRejectsSupersededAttemptEvenForSamePeripheral() {
         XCTAssertTrue(BLEManager.shouldProcessConnectTimeout(
             capturedAttempt: 5,
@@ -100,6 +195,21 @@ final class BLEAdapterValidationTests: XCTestCase {
             isConnecting: true,
             matchesPeripheral: true
         ))
+    }
+
+    func testSilentStandingConnectionWaitsForOwnedDisconnectCleanup() {
+        XCTAssertTrue(
+            BLEManager.shouldWaitForDisconnectCleanup(
+                connectionState: .disconnected,
+                stillOwnsPeripheral: true
+            )
+        )
+        XCTAssertFalse(
+            BLEManager.shouldWaitForDisconnectCleanup(
+                connectionState: .connecting,
+                stillOwnsPeripheral: false
+            )
+        )
     }
 
     func testReconnectCleanupPreservesOnlyTheExplicitCurrentAttempt() {
