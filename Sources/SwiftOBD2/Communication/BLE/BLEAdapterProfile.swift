@@ -1,7 +1,7 @@
 import Foundation
 
 /// The write modes an adapter profile permits, in preference order.
-enum BLEAdapterWriteType: Equatable, Sendable {
+enum BLEAdapterWriteType: String, Codable, Equatable, Sendable {
     case withResponse
     case withoutResponse
 }
@@ -48,20 +48,32 @@ struct BLECharacteristicDescriptor: Equatable, Sendable {
         self.capabilities = capabilities
     }
 
-    fileprivate static func normalize(_ uuid: String) -> String {
-        uuid.uppercased()
+    static func normalize(_ uuid: String) -> String {
+        let normalized = uuid.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let bluetoothBaseSuffix = "-0000-1000-8000-00805F9B34FB"
+        if normalized.hasPrefix("0000"), normalized.hasSuffix(bluetoothBaseSuffix),
+           normalized.count == 36 {
+            return String(normalized.dropFirst(4).prefix(4))
+        }
+        return normalized
     }
 }
 
 /// A known adapter GATT layout. `displayName` is diagnostic metadata only;
 /// compatibility is resolved exclusively from the service and characteristic UUIDs.
 struct BLEAdapterProfile: Equatable, Sendable {
+    static let inferredProfileID = "inferred-gatt"
+    static let inferredProfileVersion = 1
+
     let id: String
+    let version: Int
     let displayName: String
     let serviceUUID: String
     let readCharacteristicUUID: String
     let writeCharacteristicUUID: String
     let supportedWriteTypes: [BLEAdapterWriteType]
+    let commandTerminator: String
+    let maxWriteChunkBytes: Int?
 
     init(
         id: String,
@@ -69,14 +81,20 @@ struct BLEAdapterProfile: Equatable, Sendable {
         serviceUUID: String,
         readCharacteristicUUID: String,
         writeCharacteristicUUID: String,
-        supportedWriteTypes: [BLEAdapterWriteType]
+        supportedWriteTypes: [BLEAdapterWriteType],
+        version: Int = 1,
+        commandTerminator: String = "\r",
+        maxWriteChunkBytes: Int? = nil
     ) {
         self.id = id
+        self.version = version
         self.displayName = displayName
         self.serviceUUID = BLECharacteristicDescriptor.normalize(serviceUUID)
         self.readCharacteristicUUID = BLECharacteristicDescriptor.normalize(readCharacteristicUUID)
         self.writeCharacteristicUUID = BLECharacteristicDescriptor.normalize(writeCharacteristicUUID)
         self.supportedWriteTypes = supportedWriteTypes
+        self.commandTerminator = commandTerminator
+        self.maxWriteChunkBytes = maxWriteChunkBytes
     }
 
     var characteristicUUIDs: [String] {
@@ -89,6 +107,7 @@ struct BLEAdapterProfile: Equatable, Sendable {
 
 struct BLEAdapterBinding: Equatable, Sendable {
     let profile: BLEAdapterProfile
+    let source: BLEAdapterProfileSource
     let readCharacteristicUUID: String
     let writeCharacteristicUUID: String
     let writeType: BLEAdapterWriteType
@@ -101,6 +120,10 @@ enum BLEAdapterProfileResolutionError: Error, Equatable, Sendable {
     case ambiguousCharacteristic(String)
     case unsupportedReadProperties(String)
     case unsupportedWriteProperties(String)
+    case ambiguousServices([String])
+    case ambiguousInferredCharacteristics(String)
+    case inferenceNotAuthorized
+    case noCompatibleCharacteristics
 }
 
 /// The single source of truth for supported BLE adapter layouts.
@@ -192,6 +215,7 @@ struct BLEAdapterRegistry: Sendable {
 
         return .success(BLEAdapterBinding(
             profile: profile,
+            source: .known,
             readCharacteristicUUID: read.uuid,
             writeCharacteristicUUID: write.uuid,
             writeType: selectedWriteType

@@ -46,6 +46,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     @Published public private(set) var isScanning: Bool = false
     @Published public private(set) var connectedPeripheral: CBPeripheral?
+    @Published public private(set) var adapterCompatibilityReport: BLECompatibilityReport?
 
     // MARK: - Connection Metadata Cache
     /// Cached OBDInfo from last successful connection (survives transient reconnect failures)
@@ -65,6 +66,8 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     private var elm327: ELM327
 
     private var cancellables = Set<AnyCancellable>()
+    private var compatibilityReportCancellable: AnyCancellable?
+    private let compatibilityAttemptFence = BLECompatibilityAttemptFence()
 
     /// Initializes the OBDService object.
     ///
@@ -87,6 +90,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         }
 #endif
         elm327.obdDelegate = self
+        bindCompatibilityReporting()
     }
 
     // MARK: - Connection Handling
@@ -107,6 +111,9 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Returns: Information about the connected vehicle (`OBDInfo`).
     /// - Throws: Errors that might occur during the connection process.
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7, peripheral: CBPeripheral? = nil) async throws -> OBDInfo {
+        let compatibilityAttempt = compatibilityAttemptFence.begin()
+        let bleManager = currentBLEManager
+        var managerAttempt: UInt64?
         let startTime = CFAbsoluteTimeGetCurrent()
         var connectionStage = OBDConnectionStage.adapterTransport
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
@@ -114,14 +121,72 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         do {
             obdDebug("Connecting to adapter...", category: .connection)
             try await elm327.connectToAdapter(timeout: timeout, peripheral: peripheral)
+            if let bleManager {
+                let activeManagerAttempt = bleManager.currentCompatibilityAttemptToken
+                managerAttempt = activeManagerAttempt
+                try ensureCurrentCompatibilityAttempt(
+                    compatibilityAttempt,
+                    manager: bleManager,
+                    managerAttempt: activeManagerAttempt
+                )
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: activeManagerAttempt
+                )
+            } else {
+                try ensureCurrentCompatibilityAttempt(compatibilityAttempt)
+            }
 
             connectionStage = .adapterInitialization
             obdDebug("Initializing adapter...", category: .connection)
+            if let bleManager, let managerAttempt {
+                bleManager.recordAdapterInitializationStarted(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
             try await elm327.adapterInitialization()
+            try ensureCurrentCompatibilityAttempt(
+                compatibilityAttempt,
+                manager: bleManager,
+                managerAttempt: managerAttempt
+            )
+            if let bleManager, let managerAttempt {
+                bleManager.recordAdapterInitialized(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
 
             connectionStage = .vehicleCommunication
             obdDebug("Initializing vehicle connection...", category: .connection)
+            if let bleManager, let managerAttempt {
+                bleManager.recordVehicleProbeStarted(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
             let vehicleInfo = try await initializeVehicle(preferedProtocol)
+            try ensureCurrentCompatibilityAttempt(
+                compatibilityAttempt,
+                manager: bleManager,
+                managerAttempt: managerAttempt
+            )
+            if let bleManager, let managerAttempt {
+                bleManager.recordVehicleValidated(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
 
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
@@ -142,6 +207,13 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection failed", duration: duration, success: false)
             obdError("Connection failed during \(connectionStage.rawValue): \(error.localizedDescription)", category: .connection)
+            await recordCompatibilityFailure(
+                error,
+                connectionStage: connectionStage,
+                manager: bleManager,
+                managerAttempt: managerAttempt,
+                serviceAttempt: compatibilityAttempt
+            )
             throw OBDServiceError.connectionFailed(stage: connectionStage, underlyingError: error)
         }
     }
@@ -167,12 +239,14 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     /// Terminates the connection with the OBD2 adapter.
     public func stopConnection() {
+        markCompatibilityDisconnected()
         elm327.stopConnection()
     }
 
     /// Stop connection and wait for full cleanup
     /// Use this for reliable reconnection
     public func stopConnectionAsync() async {
+        markCompatibilityDisconnected()
         elm327.stopConnection()
         elm327.resetState()
         // Small delay to allow Bluetooth stack to process disconnect
@@ -188,6 +262,9 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     private func initializeELM327() {
+        compatibilityReportCancellable?.cancel()
+        compatibilityReportCancellable = nil
+
         switch connectionType {
         case .bluetooth:
             let bleManager = BLEManager()
@@ -198,6 +275,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             elm327 = ELM327(comm: MOCKComm())
         }
         elm327.obdDelegate = self
+        bindCompatibilityReporting()
     }
 
     // MARK: - Scanning, State & Auto-Reconnect (CommProtocol Pass-throughs)
@@ -253,17 +331,68 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// Reinitialize ELM327 after BLE auto-reconnect.
     /// BLE is already connected — only runs adapter init + vehicle setup.
     public func reinitializeConnection(preferedProtocol: PROTOCOL? = nil) async throws -> OBDInfo {
+        let compatibilityAttempt = compatibilityAttemptFence.begin()
+        let bleManager = currentBLEManager
+        let managerAttempt = bleManager?.currentCompatibilityAttemptToken
+        var connectionStage = OBDConnectionStage.adapterInitialization
         obdInfo("Reinitializing connection (BLE already connected)...", category: .connection)
-        try await elm327.adapterInitialization()
-        let vehicleInfo = try await initializeVehicle(preferedProtocol)
+        do {
+            if let bleManager, let managerAttempt {
+                bleManager.recordAdapterInitializationStarted(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
+            try await elm327.adapterInitialization()
+            try ensureCurrentCompatibilityAttempt(
+                compatibilityAttempt,
+                manager: bleManager,
+                managerAttempt: managerAttempt
+            )
+            if let bleManager, let managerAttempt {
+                bleManager.recordAdapterInitialized(expectedAttempt: managerAttempt)
+                bleManager.recordVehicleProbeStarted(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
+            connectionStage = .vehicleCommunication
+            let vehicleInfo = try await initializeVehicle(preferedProtocol)
+            try ensureCurrentCompatibilityAttempt(
+                compatibilityAttempt,
+                manager: bleManager,
+                managerAttempt: managerAttempt
+            )
+            if let bleManager, let managerAttempt {
+                bleManager.recordVehicleValidated(expectedAttempt: managerAttempt)
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            }
 
-        // Cache connection metadata (overwrite with fresh data)
-        await MainActor.run {
-            self.latestOBDInfo = vehicleInfo
-            // Peripheral name unchanged on reinit — preserve existing cache
+            // Cache connection metadata (overwrite with fresh data)
+            await MainActor.run {
+                self.latestOBDInfo = vehicleInfo
+                // Peripheral name unchanged on reinit — preserve existing cache
+            }
+
+            return vehicleInfo
+        } catch {
+            await recordCompatibilityFailure(
+                error,
+                connectionStage: connectionStage,
+                manager: bleManager,
+                managerAttempt: managerAttempt,
+                serviceAttempt: compatibilityAttempt
+            )
+            throw error
         }
-
-        return vehicleInfo
     }
 
     // MARK: - Request Handling
@@ -438,9 +567,32 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     public func connectToPeripheral(peripheral: CBPeripheral) async throws {
+        let compatibilityAttempt = compatibilityAttemptFence.begin()
+        let bleManager = currentBLEManager
         do {
             try await elm327.connectToAdapter(timeout: 5, peripheral: peripheral)
+            if let bleManager {
+                let managerAttempt = bleManager.currentCompatibilityAttemptToken
+                try ensureCurrentCompatibilityAttempt(
+                    compatibilityAttempt,
+                    manager: bleManager,
+                    managerAttempt: managerAttempt
+                )
+                await synchronizeCompatibilityReport(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt,
+                    managerAttempt: managerAttempt
+                )
+            } else {
+                try ensureCurrentCompatibilityAttempt(compatibilityAttempt)
+            }
         } catch {
+            if let bleManager {
+                await synchronizeTerminalCompatibilityFailure(
+                    from: bleManager,
+                    serviceAttempt: compatibilityAttempt
+                )
+            }
             throw OBDServiceError.adapterConnectionFailed(underlyingError: error)
         }
     }
@@ -506,6 +658,183 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 //                print("Error processing commands.json: \(error)")
 //            }
 //    }
+
+    private var currentBLEManager: BLEManager? {
+        elm327.commManager as? BLEManager
+    }
+
+    private func bindCompatibilityReporting() {
+        compatibilityReportCancellable?.cancel()
+        compatibilityReportCancellable = nil
+
+        guard let manager = currentBLEManager else {
+            if Thread.isMainThread {
+                adapterCompatibilityReport = nil
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.currentBLEManager == nil else { return }
+                    self.adapterCompatibilityReport = nil
+                }
+            }
+            return
+        }
+
+        compatibilityReportCancellable = manager.compatibilityReportPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak manager] _ in
+                guard let self,
+                      let manager,
+                      self.currentBLEManager === manager else { return }
+                // Fetch the manager's current value on the delivery queue instead
+                // of assigning the queued value. A delayed notification from an
+                // earlier attempt therefore cannot replace a newer report.
+                self.adapterCompatibilityReport = manager.currentCompatibilityReport
+            }
+    }
+
+    private func synchronizeCompatibilityReport(
+        from manager: BLEManager,
+        serviceAttempt: UInt64,
+        managerAttempt: UInt64
+    ) async {
+        await MainActor.run {
+            guard self.compatibilityAttemptFence.isCurrent(serviceAttempt),
+                  self.currentBLEManager === manager,
+                  manager.currentCompatibilityAttemptToken == managerAttempt else { return }
+            self.adapterCompatibilityReport = manager.currentCompatibilityReport
+        }
+    }
+
+    private func synchronizeTerminalCompatibilityFailure(
+        from manager: BLEManager,
+        serviceAttempt: UInt64
+    ) async {
+        await MainActor.run {
+            guard self.compatibilityAttemptFence.isCurrent(serviceAttempt),
+                  self.currentBLEManager === manager,
+                  let report = manager.currentCompatibilityReport,
+                  report.failure != nil else { return }
+            self.adapterCompatibilityReport = report
+        }
+    }
+
+    private func ensureCurrentCompatibilityAttempt(
+        _ serviceAttempt: UInt64,
+        manager: BLEManager? = nil,
+        managerAttempt: UInt64? = nil
+    ) throws {
+        guard compatibilityAttemptFence.isCurrent(serviceAttempt) else {
+            throw CancellationError()
+        }
+        if let manager {
+            guard currentBLEManager === manager,
+                  let managerAttempt,
+                  manager.currentCompatibilityAttemptToken == managerAttempt else {
+                throw CancellationError()
+            }
+        }
+        try Task.checkCancellation()
+    }
+
+    private func recordCompatibilityFailure(
+        _ error: Error,
+        connectionStage: OBDConnectionStage,
+        manager: BLEManager?,
+        managerAttempt: UInt64?,
+        serviceAttempt: UInt64
+    ) async {
+        guard let manager,
+              currentBLEManager === manager,
+              compatibilityAttemptFence.isCurrent(serviceAttempt) else { return }
+
+        guard let activeManagerAttempt = managerAttempt else {
+            // A transport failure can occur before startConnection captures
+            // the attempt token created inside BLEManager.connectAsync. Never
+            // guess with the manager's current token: a restored/background
+            // reconnect may already own it. BLEManager publishes its own
+            // discovery/GATT/subscription failure before throwing, so copy
+            // only an already-terminal report in this case.
+            await synchronizeTerminalCompatibilityFailure(
+                from: manager,
+                serviceAttempt: serviceAttempt
+            )
+            return
+        }
+        guard manager.currentCompatibilityAttemptToken == activeManagerAttempt else { return }
+
+        let currentReport = manager.currentCompatibilityReport
+        if currentReport?.failure != nil {
+            // The manager may already know this was an unsupported GATT
+            // layout, subscription failure, write failure, or disconnect.
+            // Preserve that transport evidence instead of relabeling it as
+            // an adapter-setup or vehicle-ECU failure.
+        } else if error is CancellationError {
+            manager.recordFailure(
+                .cancelled,
+                stage: .failed,
+                subscription: currentReport?.subscription ?? .notRequested,
+                expectedAttempt: activeManagerAttempt
+            )
+        } else {
+            switch connectionStage {
+            case .adapterTransport:
+                manager.recordFailure(
+                    .transportUnavailable,
+                    stage: .failed,
+                    subscription: currentReport?.subscription ?? .notRequested,
+                    expectedAttempt: activeManagerAttempt
+                )
+            case .adapterInitialization:
+                if currentReport?.subscription == .confirmed {
+                    manager.recordFailure(
+                        .adapterConfigurationRejected,
+                        stage: .failed,
+                        subscription: .confirmed,
+                        expectedAttempt: activeManagerAttempt
+                    )
+                } else {
+                    manager.recordFailure(
+                        .transportUnavailable,
+                        stage: .failed,
+                        subscription: currentReport?.subscription ?? .notRequested,
+                        expectedAttempt: activeManagerAttempt
+                    )
+                }
+            case .vehicleCommunication:
+                if currentReport?.subscription == .confirmed {
+                    manager.recordVehicleUnavailable(expectedAttempt: activeManagerAttempt)
+                } else {
+                    manager.recordFailure(
+                        .transportUnavailable,
+                        stage: .failed,
+                        subscription: currentReport?.subscription ?? .notRequested,
+                        expectedAttempt: activeManagerAttempt
+                    )
+                }
+            }
+        }
+
+        await synchronizeCompatibilityReport(
+            from: manager,
+            serviceAttempt: serviceAttempt,
+            managerAttempt: activeManagerAttempt
+        )
+    }
+
+    private func markCompatibilityDisconnected() {
+        let serviceAttempt = compatibilityAttemptFence.begin()
+        guard let manager = currentBLEManager else { return }
+        manager.recordDisconnected()
+        let managerAttempt = manager.currentCompatibilityAttemptToken
+        DispatchQueue.main.async { [weak self, weak manager] in
+            guard let self,
+                  let manager,
+                  self.compatibilityAttemptFence.isCurrent(serviceAttempt),
+                  self.currentBLEManager === manager,
+                  manager.currentCompatibilityAttemptToken == managerAttempt else { return }
+            self.adapterCompatibilityReport = manager.currentCompatibilityReport
+        }
+    }
 
 }
 
