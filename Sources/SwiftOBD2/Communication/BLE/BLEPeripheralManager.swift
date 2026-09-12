@@ -42,6 +42,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     private var handlerConfigurationToken: UInt64 = 0
     private var subscriptionPublication = BLESubscriptionPublicationState()
     private var discoveryScope: DiscoveryScope = .knownProfilesOnly
+    private var didCompleteServiceDiscovery = false
     private var pendingServiceIDs = Set<ObjectIdentifier>()
     private var discoveredServices: [ObjectIdentifier: CBService] = [:]
     private var discoveredCharacteristics: [ObjectIdentifier: [CBCharacteristic]] = [:]
@@ -80,6 +81,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
             connectedPeripheral = nil
             setupToken = nil
             subscriptionPublication = BLESubscriptionPublicationState()
+            didCompleteServiceDiscovery = false
             connectionGeneration += 1
             pendingServiceIDs.removeAll()
             discoveredServices.removeAll()
@@ -110,6 +112,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
             handlerConfigurationToken = configurationToken
             subscriptionPublication = BLESubscriptionPublicationState()
             discoveryScope = scope
+            didCompleteServiceDiscovery = false
             pendingServiceIDs.removeAll()
             discoveredServices.removeAll()
             discoveredCharacteristics.removeAll()
@@ -144,6 +147,37 @@ class BLEPeripheralManager: NSObject, ObservableObject {
                   let fingerprint = resolvedFingerprint,
                   let peripheral = connectedPeripheral else { return nil }
             return (binding, fingerprint, peripheral.identifier.uuidString, connectionGeneration)
+        }
+    }
+
+    /// Privacy-safe setup evidence paired with the current setup token. This
+    /// builds from the graph collected so far, allowing a timeout or discovery
+    /// error to retain partial UUID/property evidence until lifecycle reset.
+    func compatibilityEvidenceSnapshot() -> (
+        binding: BLEAdapterBinding?,
+        graph: [BLEGATTServiceDescriptor],
+        graphWasFiltered: Bool
+    )? {
+        stateLock.withLock {
+            guard setupToken != nil, connectedPeripheral != nil else { return nil }
+            let graph = discoveredServices.map { serviceID, service in
+                BLEGATTServiceDescriptor(
+                    uuid: service.uuid.uuidString,
+                    characteristics: (discoveredCharacteristics[serviceID] ?? []).map {
+                        BLECharacteristicDescriptor(
+                            uuid: $0.uuid.uuidString,
+                            capabilities: BLECharacteristicHandler.capabilities(for: $0)
+                        )
+                    }
+                )
+            }
+            return (
+                resolvedBinding,
+                graph,
+                discoveryScope == .knownProfilesOnly
+                    || !didCompleteServiceDiscovery
+                    || !pendingServiceIDs.isEmpty
+            )
         }
     }
 
@@ -224,6 +258,12 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         }
 
         let allServices = peripheral.services ?? []
+        let didRecordServiceDiscovery = stateLock.withLock { () -> Bool in
+            guard matches(context, peripheral: peripheral) else { return false }
+            didCompleteServiceDiscovery = true
+            return true
+        }
+        guard didRecordServiceDiscovery else { return }
         let services: [CBService]
         switch context.scope {
         case .knownProfilesOnly:

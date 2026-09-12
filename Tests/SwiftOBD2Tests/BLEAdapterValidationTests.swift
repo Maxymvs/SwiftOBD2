@@ -32,15 +32,51 @@ final class BLEAdapterValidationTests: XCTestCase {
     }
 
     func testDisconnectPreservesTerminalFailureButReplacesSuccessfulState() {
+        let graph = BLECompatibilityService(
+            uuid: "FFE0",
+            characteristics: [
+                BLECompatibilityCharacteristic(
+                    uuid: "FFE1",
+                    properties: [.notify, .writeWithResponse]
+                ),
+            ]
+        )
+        let channel = BLECompatibilityChannel(
+            serviceUUID: "FFE0",
+            readCharacteristic: graph.characteristics[0],
+            writeCharacteristic: graph.characteristics[0],
+            writeMode: .withResponse
+        )
+        let timings = [BLECompatibilityStageDuration(stage: .discovery, durationMilliseconds: 42)]
         let failed = BLECompatibilityReport(
             profileID: "inferred-gatt",
             profileVersion: 1,
             source: .inferred,
             stage: .failed,
             subscription: .failed,
-            failure: .notificationSubscriptionFailed
+            failure: .notificationSubscriptionFailed,
+            selectedChannel: channel,
+            discoveredServices: [graph],
+            stageDurations: timings
         )
         XCTAssertEqual(BLEManager.compatibilityReportAfterDisconnect(failed), failed)
+
+        let vehicleUnavailable = BLECompatibilityReport(
+            profileID: "known",
+            profileVersion: 1,
+            source: .known,
+            stage: .adapterValidated,
+            subscription: .confirmed,
+            failure: .vehicleECUUnavailable,
+            selectedChannel: channel,
+            discoveredServices: [graph],
+            stageDurations: timings
+        )
+        XCTAssertEqual(
+            BLEManager.compatibilityReportAfterDisconnect(vehicleUnavailable),
+            vehicleUnavailable,
+            "Cleanup must retain the actionable no-ECU outcome and its evidence"
+        )
 
         let compatible = BLECompatibilityReport(
             profileID: "known",
@@ -48,12 +84,17 @@ final class BLEAdapterValidationTests: XCTestCase {
             source: .known,
             stage: .compatible,
             subscription: .confirmed,
-            failure: nil
+            failure: nil,
+            selectedChannel: channel,
+            discoveredServices: [graph],
+            stageDurations: timings
         )
         let disconnected = BLEManager.compatibilityReportAfterDisconnect(compatible)
         XCTAssertEqual(disconnected.stage, .disconnected)
         XCTAssertEqual(disconnected.failure, .disconnected)
         XCTAssertEqual(disconnected.profileID, compatible.profileID)
+        XCTAssertEqual(disconnected.selectedChannel, compatible.selectedChannel)
+        XCTAssertEqual(disconnected.discoveredServices, compatible.discoveredServices)
     }
 
     func testCompatibilityCallbackOwnershipAllowsOnlyCurrentOrExpectedCleanup() {
@@ -224,6 +265,87 @@ final class BLEAdapterValidationTests: XCTestCase {
         XCTAssertTrue(BLECompatibilityResetPolicy.shouldRecordDisconnected(
             preservedAttempt: 6,
             currentAttempt: 7
+        ))
+    }
+
+    func testCompatibilityTimelineUsesMonotonicDurationsAndStopsAtOutcome() {
+        var timeline = BLECompatibilityTimeline()
+        timeline.begin(atNanoseconds: 1_000_000)
+
+        XCTAssertEqual(
+            timeline.snapshot(transitioningTo: .discovery, atNanoseconds: 11_000_000),
+            [BLECompatibilityStageDuration(stage: .discovery, durationMilliseconds: 10)]
+        )
+        XCTAssertEqual(
+            timeline.snapshot(transitioningTo: .discovery, atNanoseconds: 21_000_000),
+            [BLECompatibilityStageDuration(stage: .discovery, durationMilliseconds: 20)],
+            "Repeated snapshots must measure from the stage start, not double count"
+        )
+
+        _ = timeline.snapshot(transitioningTo: .subscription, atNanoseconds: 31_000_000)
+        let terminal = timeline.snapshot(
+            transitioningTo: .adapterValidated,
+            atNanoseconds: 81_000_000,
+            terminalOutcome: true
+        )
+        XCTAssertEqual(terminal, [
+            BLECompatibilityStageDuration(stage: .discovery, durationMilliseconds: 30),
+            BLECompatibilityStageDuration(stage: .subscription, durationMilliseconds: 50),
+            BLECompatibilityStageDuration(stage: .adapterValidated, durationMilliseconds: 0),
+        ])
+        XCTAssertEqual(
+            timeline.snapshot(transitioningTo: .disconnected, atNanoseconds: 3_600_081_000_000),
+            terminal,
+            "A finished compatibility attempt must not count later driving time"
+        )
+    }
+
+    func testAttemptFenceRejectsTimingUpdateFromSupersededAttempt() {
+        let fence = BLECompatibilityAttemptFence()
+        let oldAttempt = fence.begin()
+        let currentAttempt = fence.begin()
+
+        XCTAssertFalse(fence.isCurrent(oldAttempt))
+        XCTAssertTrue(fence.isCurrent(currentAttempt))
+    }
+
+    func testReportEvidenceFallbackIsFencedToTheSameAttempt() {
+        let previous = BLECompatibilityReport(
+            profileID: "ffe0-shared",
+            profileVersion: 1,
+            source: .known,
+            stage: .subscription,
+            subscription: .confirmed,
+            failure: nil,
+            selectedChannel: BLECompatibilityChannel(
+                serviceUUID: "FFE0",
+                readCharacteristic: BLECompatibilityCharacteristic(
+                    uuid: "FFE1",
+                    properties: [.notify]
+                ),
+                writeCharacteristic: BLECompatibilityCharacteristic(
+                    uuid: "FFE1",
+                    properties: [.writeWithResponse]
+                ),
+                writeMode: .withResponse
+            ),
+            discoveredServices: [
+                BLECompatibilityService(uuid: "FFE0", characteristics: []),
+            ]
+        )
+
+        XCTAssertEqual(
+            BLEManager.sameAttemptCompatibilityReport(
+                previous,
+                reportAttempt: 8,
+                expectedAttempt: 8
+            ),
+            previous
+        )
+        XCTAssertNil(BLEManager.sameAttemptCompatibilityReport(
+            previous,
+            reportAttempt: 7,
+            expectedAttempt: 8
         ))
     }
 
@@ -460,6 +582,112 @@ final class BLEAdapterBindingCacheTests: XCTestCase {
         XCTAssertFalse(encoded.contains("peripheral"))
         XCTAssertFalse(encoded.contains("VIN"))
         XCTAssertFalse(encoded.contains("NO DATA"))
+    }
+
+    func testReportDecodesLegacyJSONWithEmptyDiagnosticDefaults() throws {
+        let legacyJSON = Data("""
+        {
+          "profileID": "ffe0-shared",
+          "profileVersion": 1,
+          "source": "known",
+          "stage": "compatible",
+          "subscription": "confirmed",
+          "capturedAt": 42
+        }
+        """.utf8)
+
+        let report = try JSONDecoder().decode(BLECompatibilityReport.self, from: legacyJSON)
+
+        XCTAssertNil(report.selectedChannel)
+        XCTAssertTrue(report.discoveredServices.isEmpty)
+        XCTAssertFalse(report.discoveredGraphWasTruncated)
+        XCTAssertTrue(report.stageDurations.isEmpty)
+    }
+
+    func testReportSanitizesAndBoundsDiscoveredGraph() throws {
+        let services = (0..<20).map { serviceIndex in
+            BLECompatibilityService(
+                uuid: String(format: "%04X", serviceIndex),
+                characteristics: (0..<40).map { characteristicIndex in
+                    BLECompatibilityCharacteristic(
+                        uuid: characteristicIndex == 0
+                            ? "VIN secret value"
+                            : String(format: "%04X", characteristicIndex),
+                        properties: [.writeWithoutResponse, .notify, .notify]
+                    )
+                }
+            )
+        }
+
+        let report = BLECompatibilityReport(
+            profileID: nil,
+            profileVersion: nil,
+            source: nil,
+            stage: .failed,
+            subscription: .notRequested,
+            failure: .unsupportedGATT,
+            discoveredServices: services
+        )
+        let encoded = try XCTUnwrap(String(
+            data: JSONEncoder().encode(report),
+            encoding: .utf8
+        ))
+
+        XCTAssertEqual(report.discoveredServices.count, 16)
+        XCTAssertTrue(report.discoveredServices.allSatisfy { $0.characteristics.count == 32 })
+        XCTAssertTrue(report.discoveredGraphWasTruncated)
+        XCTAssertEqual(
+            BLECompatibilityCharacteristic(uuid: "VIN secret value", properties: []).uuid,
+            "INVALID"
+        )
+        XCTAssertFalse(encoded.contains("VIN secret value"))
+    }
+
+    func testFailureReportRetainsGraphWithoutResolvedBinding() {
+        let graph = [service("ABCD", [
+            characteristic("A001", [.read]),
+            characteristic("A002", [.writeWithResponse]),
+        ])]
+
+        let report = BLECompatibilityReport(
+            binding: nil,
+            discoveredGraph: graph,
+            discoveredGraphWasTruncated: true,
+            stage: .failed,
+            subscription: .notRequested,
+            failure: .unsupportedGATT
+        )
+
+        XCTAssertNil(report.selectedChannel)
+        XCTAssertEqual(report.discoveredServices.map(\.uuid), ["ABCD"])
+        XCTAssertEqual(report.discoveredServices[0].characteristics.map(\.uuid), ["A001", "A002"])
+        XCTAssertTrue(report.discoveredGraphWasTruncated)
+    }
+
+    func testResolvedBindingExportsSelectedChannelPropertiesAndWriteMode() throws {
+        let graph = [service("FFE0", [
+            characteristic("FFE1", [.notify, .writeWithResponse, .writeWithoutResponse]),
+        ])]
+        let binding = try BLEAdapterRegistry.standard.resolve(
+            services: graph,
+            inferenceAuthorization: .denied
+        ).get()
+
+        let report = BLECompatibilityReport(
+            binding: binding,
+            discoveredGraph: graph,
+            stage: .subscription,
+            subscription: .confirmed
+        )
+
+        XCTAssertEqual(report.selectedChannel?.serviceUUID, "FFE0")
+        XCTAssertEqual(report.selectedChannel?.readCharacteristic.uuid, "FFE1")
+        XCTAssertEqual(
+            report.selectedChannel?.readCharacteristic.properties,
+            [.notify, .writeWithResponse, .writeWithoutResponse]
+        )
+        XCTAssertEqual(report.selectedChannel?.writeCharacteristic.uuid, "FFE1")
+        XCTAssertEqual(report.selectedChannel?.writeMode, .withResponse)
     }
 
     private func inferredFixture(

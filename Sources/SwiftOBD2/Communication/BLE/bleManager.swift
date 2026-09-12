@@ -138,6 +138,8 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     private let compatibilityAttemptFence = BLECompatibilityAttemptFence()
     private var activeCompatibilityAttempt: UInt64 = 0
     private var compatibilityReportStorage: BLECompatibilityReport?
+    private var compatibilityReportAttempt: UInt64?
+    private var compatibilityTimeline = BLECompatibilityTimeline()
     private var channelValidationTask: Task<Void, Error>?
     private var channelValidationAttempt: UInt64?
     private var compatibilityAttemptPreservedDuringReset: UInt64?
@@ -212,6 +214,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             preparedPeripheralAttempt = nil
             requestedTeardown.clear()
             activeCompatibilityAttempt = attempt
+            compatibilityTimeline.begin(atNanoseconds: DispatchTime.now().uptimeNanoseconds)
             return attempt
         }
         publishCompatibilityReport(
@@ -226,25 +229,71 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         stage: BLECompatibilityStage,
         subscription: BLESubscriptionStatus,
         failure: BLECompatibilityFailure? = nil,
-        attempt: UInt64
+        attempt: UInt64,
+        preservingExistingFailure: Bool = false
     ) {
         guard compatibilityAttemptFence.isCurrent(attempt) else { return }
         let mayUseResolvedIdentity = compatibilityLock.withLock {
             preparedPeripheralAttempt == attempt
         }
-        let binding = mayUseResolvedIdentity
-            ? peripheralManager?.resolutionSnapshot()?.binding
+        // Preserve the established lock order: peripheral evidence is captured
+        // before entering compatibilityLock, then revalidated against the
+        // attempt before publication.
+        let evidence = mayUseResolvedIdentity
+            ? peripheralManager?.compatibilityEvidenceSnapshot()
             : nil
-        let report = BLECompatibilityReport(
-            binding: binding,
-            stage: stage,
-            subscription: subscription,
-            failure: failure
-        )
         compatibilityLock.withLock {
             guard activeCompatibilityAttempt == attempt,
                   compatibilityAttemptFence.isCurrent(attempt) else { return }
+            let previous = Self.sameAttemptCompatibilityReport(
+                compatibilityReportStorage,
+                reportAttempt: compatibilityReportAttempt,
+                expectedAttempt: attempt
+            )
+            if preservingExistingFailure, previous?.failure != nil { return }
+            let mayPublishEvidence = preparedPeripheralAttempt == attempt
+            let now = DispatchTime.now().uptimeNanoseconds
+            let durations = compatibilityTimeline.snapshot(
+                transitioningTo: stage,
+                atNanoseconds: now,
+                terminalOutcome: failure != nil
+            )
+            let report: BLECompatibilityReport
+            if mayPublishEvidence, let evidence {
+                report = BLECompatibilityReport(
+                    binding: evidence.binding,
+                    discoveredGraph: evidence.graph,
+                    discoveredGraphWasTruncated: evidence.graphWasFiltered,
+                    stage: stage,
+                    subscription: subscription,
+                    failure: failure,
+                    stageDurations: durations
+                )
+            } else if let previous {
+                report = BLECompatibilityReport(
+                    profileID: previous.profileID,
+                    profileVersion: previous.profileVersion,
+                    source: previous.source,
+                    stage: stage,
+                    subscription: subscription,
+                    failure: failure,
+                    selectedChannel: previous.selectedChannel,
+                    discoveredServices: previous.discoveredServices,
+                    discoveredGraphWasTruncated: previous.discoveredGraphWasTruncated,
+                    stageDurations: durations
+                )
+            } else {
+                report = BLECompatibilityReport(
+                    binding: nil,
+                    discoveredGraph: [],
+                    stage: stage,
+                    subscription: subscription,
+                    failure: failure,
+                    stageDurations: durations
+                )
+            }
             compatibilityReportStorage = report
+            compatibilityReportAttempt = attempt
             compatibilitySubject.send(report)
         }
     }
@@ -345,30 +394,26 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     private func publishCommandFailure(_ error: Error, attempt: UInt64) {
         guard let failure = Self.commandCompatibilityFailure(for: error) else { return }
-        compatibilityLock.withLock {
-            guard activeCompatibilityAttempt == attempt,
-                  compatibilityAttemptFence.isCurrent(attempt) else { return }
-            // A pending command is failed when the channel is torn down. Keep
-            // the earlier, more specific terminal cause (for example lost
-            // notifications) instead of replacing it with generic disconnect.
-            if compatibilityReportStorage?.stage == .failed,
-               compatibilityReportStorage?.failure != nil {
-                return
-            }
-            let binding = preparedPeripheralAttempt == attempt
-                ? peripheralManager.resolutionSnapshot()?.binding
-                : nil
-            let report = BLECompatibilityReport(
-                binding: binding,
-                stage: .failed,
-                subscription: failure == .notificationSubscriptionFailed
-                    ? .failed
-                    : compatibilityReportStorage?.subscription ?? .notRequested,
-                failure: failure
+        let subscription = compatibilityLock.withLock {
+            let previous = Self.sameAttemptCompatibilityReport(
+                compatibilityReportStorage,
+                reportAttempt: compatibilityReportAttempt,
+                expectedAttempt: attempt
             )
-            compatibilityReportStorage = report
-            compatibilitySubject.send(report)
+            return failure == .notificationSubscriptionFailed
+                ? BLESubscriptionStatus.failed
+                : previous?.subscription ?? .notRequested
         }
+        // A pending command is failed when the channel is torn down. Keep the
+        // earlier, more specific terminal cause (for example lost notifications)
+        // instead of replacing it with generic disconnect.
+        publishCompatibilityReport(
+            stage: .failed,
+            subscription: subscription,
+            failure: failure,
+            attempt: attempt,
+            preservingExistingFailure: true
+        )
     }
 
     private func isCurrentCompatibilityAttempt(_ attempt: UInt64) -> Bool {
@@ -376,6 +421,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             activeCompatibilityAttempt == attempt
                 && compatibilityAttemptFence.isCurrent(attempt)
         }
+    }
+
+    static func sameAttemptCompatibilityReport(
+        _ report: BLECompatibilityReport?,
+        reportAttempt: UInt64?,
+        expectedAttempt: UInt64
+    ) -> BLECompatibilityReport? {
+        reportAttempt == expectedAttempt ? report : nil
     }
 
     static func callbackOwnership(
@@ -537,8 +590,16 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 disconnectWasRequested = true
             }
             let previous = compatibilityReportStorage
-            let report = Self.compatibilityReportAfterDisconnect(previous)
+            let durations = compatibilityTimeline.snapshot(
+                transitioningTo: .disconnected,
+                atNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+            let report = Self.compatibilityReportAfterDisconnect(
+                previous,
+                stageDurations: durations
+            )
             compatibilityReportStorage = report
+            compatibilityReportAttempt = attempt
             compatibilitySubject.send(report)
         }
     }
@@ -546,9 +607,10 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Cleanup after a terminal failure must retain the actionable cause. A
     /// normal disconnect from a nonfailed session records generic link loss.
     static func compatibilityReportAfterDisconnect(
-        _ previous: BLECompatibilityReport?
+        _ previous: BLECompatibilityReport?,
+        stageDurations: [BLECompatibilityStageDuration]? = nil
     ) -> BLECompatibilityReport {
-        if let previous, previous.stage == .failed, previous.failure != nil {
+        if let previous, previous.failure != nil {
             return previous
         }
         return BLECompatibilityReport(
@@ -557,7 +619,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             source: previous?.source,
             stage: .disconnected,
             subscription: .notRequested,
-            failure: .disconnected
+            failure: .disconnected,
+            selectedChannel: previous?.selectedChannel,
+            discoveredServices: previous?.discoveredServices ?? [],
+            discoveredGraphWasTruncated: previous?.discoveredGraphWasTruncated ?? false,
+            stageDurations: stageDurations ?? previous?.stageDurations ?? []
         )
     }
 
@@ -1181,7 +1247,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 guard let self else { throw CancellationError() }
                 self.messageProcessor.reset()
                 self.publishCompatibilityReport(
-                    stage: .gattResolved,
+                    stage: .subscription,
                     subscription: .confirmed,
                     attempt: attempt
                 )
@@ -1206,7 +1272,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         guard shouldStartKnown else { return }
         messageProcessor.reset()
         publishCompatibilityReport(
-            stage: .gattResolved,
+            stage: .subscription,
             subscription: .confirmed,
             attempt: attempt
         )
