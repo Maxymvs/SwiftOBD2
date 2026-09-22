@@ -31,6 +31,62 @@ final class WifiTransactionTests: XCTestCase {
         DTCResponseParser.awaitsPendingResponse(lines: lines, service: .stored, family: .can11)
     }
 
+    func testSlowLegacySearchUsesSetupDeadlineWithoutRetransmitting() async throws {
+        let socket = FakeWifiSocket()
+        let manager = makeManager(socket, readTimeout: 0.03)
+        let elm = ELM327(comm: manager)
+        let search = Task { try await elm.detectProtocol() }
+        try await socket.waitForSend("ATSP0")
+        try await socket.deliverWhenArmed("OK\r>")
+        try await socket.waitForSend("0100")
+        try await socket.deliverWhenArmed("SEARCHING...\r")
+        // Deliberately exceed the ordinary-command timeout while there is no prompt.
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(socket.sentCommands, ["ATSP0", "0100"])
+        XCTAssertFalse(socket.wasCancelled)
+        try await socket.deliverWhenArmed("48 6B 10 41 00 00 00 00 00 04\r>")
+        try await socket.waitForSend("ATDPN")
+        try await socket.deliverWhenArmed("A3\r>")
+        let detected = try await search.value
+        XCTAssertEqual(detected, .protocol3)
+        XCTAssertEqual(socket.sentCommands, ["ATSP0", "0100", "ATDPN"])
+    }
+
+    func testTimedOutSetupRetiresSocketBeforeLateReplyOrNewCommand() async throws {
+        let socket = FakeWifiSocket()
+        let manager = makeManager(socket)
+        do {
+            _ = try await manager.sendSetupCommand("0100", responseTimeout: 0.05)
+            XCTFail("Expected timeout")
+        } catch {
+            guard case CommunicationError.timeout = error else { return XCTFail("Unexpected: \(error)") }
+        }
+        XCTAssertTrue(socket.wasCancelled)
+        socket.deliver("48 6B 10 41 00 00 00 00 00 04\r>")
+        do {
+            _ = try await manager.sendSetupCommand("ATDPN", responseTimeout: 0.1)
+            XCTFail("An abandoned response must never reach a new request")
+        } catch {
+            guard case CommunicationError.connectionLost = error else { return XCTFail("Unexpected: \(error)") }
+        }
+        XCTAssertEqual(socket.sentCommands, ["0100"])
+    }
+
+    func testCancelledSetupRetiresSocketAndUnblocksQueuedCommand() async throws {
+        let socket = FakeWifiSocket()
+        let manager = makeManager(socket)
+        let search = Task { try await manager.sendSetupCommand("0100", responseTimeout: 10) }
+        try await socket.waitForSend("0100")
+        let queued = Task { try await manager.sendCommand("ATDPN", retries: 1) }
+        search.cancel()
+        do { _ = try await search.value; XCTFail("Expected cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        do { _ = try await queued.value; XCTFail("Expected closed transport") }
+        catch { guard case CommunicationError.connectionLost = error else { return XCTFail("Unexpected: \(error)") } }
+        XCTAssertTrue(socket.wasCancelled)
+        XCTAssertEqual(socket.sentCommands, ["0100"])
+    }
+
     // MARK: - No hang on a socket that never answers
 
     /// (a) The fake never resolves the read. With a caller-owned `NWConnection.receive` this hung

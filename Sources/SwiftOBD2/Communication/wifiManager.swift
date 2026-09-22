@@ -13,6 +13,9 @@ import OSLog
 
 protocol CommProtocol {
     func sendCommand(_ command: String, retries: Int) async throws -> [String]
+    /// Setup never retransmits an unfinished command. On timeout/cancellation,
+    /// real transports retire the connection before another request can use it.
+    func sendSetupCommand(_ command: String, responseTimeout: TimeInterval) async throws -> [String]
     func disconnectPeripheral()
     func connectAsync(timeout: TimeInterval, peripheral: CBPeripheral?) async throws
     func scanForPeripherals() async throws
@@ -73,6 +76,10 @@ protocol CommProtocol {
 
 // Default no-op implementations for non-BLE managers
 extension CommProtocol {
+    func sendSetupCommand(_ command: String, responseTimeout: TimeInterval) async throws -> [String] {
+        try Task.checkCancellation()
+        return try await sendCommand(command, retries: 1)
+    }
     func startPeripheralScanning() {}
     func stopPeripheralScanning() {}
     var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> {
@@ -315,6 +322,21 @@ class WifiManager: CommProtocol {
 
     // MARK: - Sending
 
+    func sendSetupCommand(_ command: String, responseTimeout: TimeInterval) async throws -> [String] {
+        let acquired = await commandSemaphore.wait()
+        guard acquired else { throw CancellationError() }
+        defer { commandSemaphore.signal() }
+        do {
+            return try await sendCommandLocked(command, retries: 1, responseTimeout: responseTimeout)
+        } catch is CancellationError {
+            disconnectPeripheral()
+            throw CancellationError()
+        } catch CommunicationError.timeout {
+            disconnectPeripheral()
+            throw CommunicationError.timeout
+        }
+    }
+
     func sendCommand(_ command: String, retries: Int) async throws -> [String] {
         let acquired = await commandSemaphore.wait()
         guard acquired else { throw CancellationError() }
@@ -377,7 +399,7 @@ class WifiManager: CommProtocol {
     ///
     /// Split out so a transaction can send and then keep waiting under a single acquisition;
     /// `AsyncSemaphore` is not reentrant, so a transaction must never call `sendCommand` itself.
-    private func sendCommandLocked(_ command: String, retries: Int) async throws -> [String] {
+    private func sendCommandLocked(_ command: String, retries: Int, responseTimeout: TimeInterval? = nil) async throws -> [String] {
         guard let data = "\(command)\r".data(using: .ascii) else {
             throw CommunicationError.invalidData
         }
@@ -395,7 +417,7 @@ class WifiManager: CommProtocol {
                 // land in this request's slot; it also clears anything left over from before.
                 let token = messageProcessor.beginRequest()
                 try await socket.send(data)
-                return try await messageProcessor.awaitResponse(for: token, timeout: readTimeout)
+                return try await messageProcessor.awaitResponse(for: token, timeout: responseTimeout ?? readTimeout)
             } catch is CancellationError {
                 throw CancellationError()
             } catch let error as OBDMessageProcessorError where error == .responseTimeout {

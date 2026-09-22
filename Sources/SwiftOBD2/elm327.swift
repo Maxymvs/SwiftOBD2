@@ -132,117 +132,93 @@ class ELM327 {
     ///     - `SetupError.ignitionOff` if the vehicle's ignition is not on.
     ///     - `SetupError.invalidProtocol` if the protocol is not recognized.
     func setupVehicle(preferredProtocol: PROTOCOL?) async throws -> OBDInfo {
-        //        var obdProtocol: PROTOCOL?
         let detectedProtocol = try await detectProtocol(preferredProtocol: preferredProtocol)
-
-        //        guard let obdProtocol = detectedProtocol else {
-        //            throw SetupError.noProtocolFound
-        //        }
-
-        //        self.obdProtocol = obdProtocol
-        // Unmapped protocols (the user-configurable CAN protocols B/C) fail loudly here instead
-        // of leaving a silent `nil` parser that only surfaces as an unrelated parse failure.
         canProtocol = try detectedProtocol.parserImplementation()
-
-        let vin = await requestVin()
+        // Validate before optional metadata requests, using the same reply that
+        // established the protocol. No second 0100 can mask a failed first probe.
+        let messages = try validatedSupportedPIDMessages(r100, protocol: detectedProtocol)
+        let vin = try await requestVin()
         vehicleIdentifier = vin
-
-        //        try await setHeader(header: "7E0")
-
-        let supportedPIDs = await getSupportedPIDs()
-
-        guard let messages = try canProtocol?.parse(r100) else {
-            throw ELM327Error.invalidResponse(message: "Invalid response to 0100")
-        }
-
-        let ecuMap = populateECUMap(messages)
-
+        let supportedPIDs = try await getSupportedPIDs(duringSetup: true)
+        try Task.checkCancellation()
         connectionState = .connectedToVehicle
-        return OBDInfo(vin: vin, supportedPIDs: supportedPIDs, obdProtocol: detectedProtocol, ecuMap: ecuMap)
+        return OBDInfo(vin: vin, supportedPIDs: supportedPIDs, obdProtocol: detectedProtocol,
+                       ecuMap: populateECUMap(messages))
     }
 
     // MARK: - Protocol Selection
 
-    /// Detects the appropriate OBD protocol by attempting preferred and fallback protocols.
-    /// - Parameter preferredProtocol: An optional preferred protocol to attempt first.
-    /// - Returns: The detected `PROTOCOL`.
-    /// - Throws: `ELM327Error` if detection fails.
-    private func detectProtocol(preferredProtocol: PROTOCOL? = nil) async throws -> PROTOCOL {
-        logger.info("Starting protocol detection...")
-
-        if let protocolToTest = preferredProtocol {
-            logger.info("Attempting preferred protocol: \(protocolToTest.description)")
-            if await testProtocol(protocolToTest) {
-                return protocolToTest
-            } else {
-                logger.warning("Preferred protocol \(protocolToTest.description) failed. Falling back to automatic detection.")
+    /// One request establishes ECU evidence and lets the adapter search. A verified
+    /// reconnect hint is tried first with automatic fallback (ATTP A<n>); unlike
+    /// ATSP it does not immediately overwrite the adapter's stored preference.
+    func detectProtocol(preferredProtocol: PROTOCOL? = nil) async throws -> PROTOCOL {
+        r100 = []
+        canProtocol = nil
+        try Task.checkCancellation()
+        if let preferredProtocol, Self.genericProtocols.contains(preferredProtocol) {
+            let selection = try await setupCommand("ATTPA" + preferredProtocol.rawValue)
+            if selection != ["OK"] {
+                // Only a completed, explicit unsupported-command reply allows a
+                // fallback write. Timeout/cancellation/link loss must escape.
+                guard selection == ["?"] else { throw ELM327Error.noProtocolFound }
+                _ = try await setupOK("ATSP0")
             }
         } else {
-            do {
-                return try await detectProtocolAutomatically()
-            } catch {
-                return try await detectProtocolManually()
-            }
+            _ = try await setupOK("ATSP0")
         }
 
-        logger.error("Failed to detect a compatible OBD protocol.")
-        throw ELM327Error.noProtocolFound
+        let response = try await setupCommand("0100", timeout: OBDConnectionTiming.protocolSearch)
+        guard BLEELMResponseValidator.hasVehicleResponse(response) else { throw ELM327Error.noProtocolFound }
+        let description = try await setupCommand("ATDPN")
+        let detected = try Self.parseProtocolNumber(description)
+        _ = try validatedSupportedPIDMessages(response, protocol: detected)
+        r100 = response
+        return detected
     }
 
-    /// Attempts to detect the OBD protocol automatically.
-    /// - Returns: The detected protocol, or nil if none could be found.
-    /// - Throws: Various setup-related errors.
-    private func detectProtocolAutomatically() async throws -> PROTOCOL {
-        _ = try await okResponse("ATSP0")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-        _ = try await sendCommand("0100")
+    private static let genericProtocols: Set<PROTOCOL> = [
+        .protocol1, .protocol2, .protocol3, .protocol4, .protocol5,
+        .protocol6, .protocol7, .protocol8, .protocol9,
+    ]
 
-        let obdProtocolNumber = try await sendCommand("ATDPN")
-
-        guard let obdProtocol = PROTOCOL(rawValue: String(obdProtocolNumber[0].dropFirst())) else {
-            throw ELM327Error.invalidResponse(message: "Invalid protocol number: \(obdProtocolNumber)")
+    static func parseProtocolNumber(_ response: [String]) throws -> PROTOCOL {
+        let lines = response.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+            .filter { !$0.isEmpty && $0 != "ATDPN" }
+        guard lines.count == 1, let line = lines.first else { throw ELM327Error.invalidProtocol }
+        let number = line.hasPrefix("A") ? String(line.dropFirst()) : line
+        guard let result = PROTOCOL(rawValue: number), genericProtocols.contains(result) else {
+            throw ELM327Error.invalidProtocol
         }
-
-        _ = await testProtocol(obdProtocol)
-
-        return obdProtocol
+        return result
     }
 
-    /// Attempts to detect the OBD protocol manually.
-    /// - Parameter desiredProtocol: An optional preferred protocol to attempt first.
-    /// - Returns: The detected protocol, or nil if none could be found.
-    /// - Throws: Various setup-related errors.
-    private func detectProtocolManually() async throws -> PROTOCOL {
-        for protocolOption in PROTOCOL.allCases where protocolOption != .NONE {
-            self.logger.info("Testing protocol: \(protocolOption.description)")
-            _ = try await okResponse(protocolOption.cmd)
-            if await testProtocol(protocolOption) {
-                return protocolOption
-            }
+    private func validatedSupportedPIDMessages(_ response: [String], protocol detected: PROTOCOL) throws -> [MessageProtocol] {
+        // Check the service as well as the parsed PID and complete 32-bit bitmap.
+        // Parsers strip the service byte, so checking parsed data alone is insufficient.
+        guard BLEELMResponseValidator.hasVehicleResponse(response) else {
+            throw ELM327Error.noProtocolFound
         }
-        /// If we reach this point, no protocol was found
-        logger.error("No protocol found")
-        throw ELM327Error.noProtocolFound
+        let messages = try detected.parserImplementation().parse(response)
+        guard messages.contains(where: { message in
+            guard let data = message.data else { return false }
+            return data.count >= 5 && data.first == 0x00
+        }) else { throw ELM327Error.noProtocolFound }
+        return messages
     }
 
-    // MARK: - Protocol Testing
+    private func setupCommand(_ command: String, timeout: TimeInterval = OBDConnectionTiming.commandResponse) async throws -> [String] {
+        try Task.checkCancellation()
+        let response = try await comm.sendSetupCommand(command, responseTimeout: timeout)
+        try Task.checkCancellation()
+        return response
+    }
 
-    /// Tests a given protocol by sending a 0100 command and checking for a valid response.
-    /// - Parameter obdProtocol: The protocol to test.
-    /// - Throws: Various setup-related errors.
-    private func testProtocol(_ obdProtocol: PROTOCOL) async -> Bool {
-        // test protocol by sending 0100 and checking for 41 00 response
-        let response = try? await sendCommand("0100", retries: 3)
-
-        if let response = response,
-           response.contains(where: { $0.range(of: #"41\s*00"#, options: .regularExpression) != nil }) {
-            logger.info("Protocol \(obdProtocol.description) is valid.")
-            r100 = response
-            return true
-        } else {
-            logger.warning("Protocol \(obdProtocol.rawValue) did not return valid 0100 response.")
-            return false
-        }
+    private func setupOK(_ command: String) async throws -> [String] {
+        let response = try await setupCommand(command)
+        let lines = response.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+            .filter { !$0.isEmpty && $0 != command }
+        guard lines == ["OK"] else { throw ELM327Error.adapterInitializationFailed }
+        return response
     }
 
     // MARK: - Adapter Initialization
@@ -260,15 +236,17 @@ class ELM327 {
         // Clear stale protocol/response state from previous connection
         resetState()
         do {
-            _ = try await sendCommand("ATZ") // Reset adapter
+            _ = try await setupCommand("ATZ") // Reset adapter
             // ELM327 needs time to complete reset (adapter reboots)
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            _ = try await okResponse("ATE0") // Echo off
-            _ = try await okResponse("ATL0") // Linefeeds off
-            _ = try await okResponse("ATS0") // Spaces off
-            _ = try await okResponse("ATH1") // Headers off
-            _ = try await okResponse("ATSP0") // Set protocol to automatic
+            try await Task.sleep(for: .seconds(OBDConnectionTiming.adapterResetDelay))
+            _ = try await setupOK("ATE0") // Echo off
+            _ = try await setupOK("ATL0") // Linefeeds off
+            _ = try await setupOK("ATS0") // Spaces off
+            _ = try await setupOK("ATH1") // Headers on
+            // Protocol selection belongs to detectProtocol, including reconnect hints.
             logger.info("ELM327 adapter initialized successfully.")
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             logger.error("Adapter initialization failed: \(error.localizedDescription)")
             throw ELM327Error.adapterInitializationFailed
@@ -347,10 +325,14 @@ class ELM327 {
         try await comm.scanForPeripherals()
     }
 
-    func requestVin() async -> String? {
+    func requestVin() async throws -> String? {
         let command = OBDCommand.Mode9.VIN
-        guard let vinResponse = try? await sendCommand(command.properties.command) else {
-            return nil
+        let vinResponse: [String]
+        do {
+            vinResponse = try await setupCommand(command.properties.command)
+        } catch {
+            if Self.isNoData(error) { return nil }
+            throw error
         }
 
         guard let data = try? canProtocol?.parse(vinResponse).first?.data,
@@ -433,13 +415,25 @@ extension ELM327 {
     /// Get the supported PIDs
     /// - Returns: Array of supported PIDs
     func getSupportedPIDs() async -> [OBDCommand] {
+        (try? await getSupportedPIDs(duringSetup: false)) ?? []
+    }
+
+    private func getSupportedPIDs(duringSetup: Bool) async throws -> [OBDCommand] {
         let pidGetters = OBDCommand.pidGetters
         var supportedPIDs: [OBDCommand] = []
 
         for pidGetter in pidGetters {
             do {
                 logger.info("Getting supported PIDs for \(pidGetter.properties.command)")
-                let response = try await sendCommand(pidGetter.properties.command)
+                try Task.checkCancellation()
+                let response: [String]
+                if duringSetup && pidGetter.properties.command == "0100" {
+                    response = r100
+                } else if duringSetup {
+                    response = try await setupCommand(pidGetter.properties.command)
+                } else {
+                    response = try await sendCommand(pidGetter.properties.command)
+                }
                 // find first instance of 41 plus command sent, from there we determine the position of everything else
                 // Ex.
                 //        || ||
@@ -454,6 +448,7 @@ extension ELM327 {
 
                 supportedPIDs.append(contentsOf: supportedCommands)
             } catch {
+                if error is CancellationError || (duringSetup && !Self.isNoData(error)) { throw error }
                 logger.error("\(error.localizedDescription)")
             }
         }
@@ -462,6 +457,12 @@ extension ELM327 {
 
         // remove duplicates
         return Array(Set(supportedPIDs))
+    }
+
+    private static func isNoData(_ error: Error) -> Bool {
+        if let error = error as? BLEManagerError, case .noData = error { return true }
+        if let error = error as? CommunicationError, case .noData = error { return true }
+        return false
     }
 
     private func parseResponse(_ response: [String]) -> Set<String>? {

@@ -1399,6 +1399,14 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Serialized by `commandSemaphore` — only one command is in-flight at a time.
     /// Uses a deterministic 3-step protocol: `beginRequest()` → BLE write → `awaitResponse()`.
     func sendCommand(_ command: String, retries: Int = 3) async throws -> [String] {
+        try await sendSerializedCommand(command, retries: retries, setupResponseTimeout: nil)
+    }
+
+    func sendSetupCommand(_ command: String, responseTimeout: TimeInterval) async throws -> [String] {
+        try await sendSerializedCommand(command, retries: 1, setupResponseTimeout: responseTimeout)
+    }
+
+    private func sendSerializedCommand(_ command: String, retries: Int, setupResponseTimeout: TimeInterval?) async throws -> [String] {
         let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
         let acquired = await commandSemaphore.wait()
         guard acquired else {
@@ -1411,9 +1419,20 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
                 throw CancellationError()
             }
-            return try await sendCommandLocked(command, retries: retries)
+            return try await sendCommandLocked(command, retries: retries, responseTimeout: setupResponseTimeout)
         } catch {
             publishCommandFailure(error, attempt: compatibilityAttempt)
+            if setupResponseTimeout != nil,
+               error is CancellationError || error is BLEWriteCoordinatorError
+                || (error as? OBDMessageProcessorError) == .responseTimeout {
+                // A request token cannot identify late bytes on the wire. Retire
+                // this attempt synchronously, then cancel the physical link.
+                compatibilityLock.withLock {
+                    guard compatibilityAttemptFence.isCurrent(compatibilityAttempt) else { return }
+                    recordDisconnected(expectDisconnectCallback: true)
+                    disconnectPeripheral()
+                }
+            }
             throw error
         }
     }
@@ -1423,11 +1442,17 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Split out so a multi-window transaction can send and then keep listening under a single
     /// acquisition; `AsyncSemaphore` is not reentrant, so a transaction must never call
     /// `sendCommand` itself.
-    private func sendCommandLocked(_ command: String, retries: Int) async throws -> [String] {
+    private func sendCommandLocked(_ command: String, retries: Int, responseTimeout: TimeInterval? = nil) async throws -> [String] {
         try Task.checkCancellation()
 
         for attempt in 1...retries {
             try Task.checkCancellation()
+            // Shared by ordinary commands and DTC transactions, including a
+            // caller queued after setup retired the connection but before the
+            // physical disconnect callback has arrived.
+            guard compatibilityLock.withLock({ requestedTeardown.attempt == nil }) else {
+                throw BLEManagerError.peripheralNotConnected
+            }
             // Validate peripheral per attempt (connection may drop between retries)
             guard let peripheral = peripheralManager.connectedPeripheral else {
                 obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
@@ -1435,6 +1460,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             }
 
             do {
+                let started = DispatchTime.now().uptimeNanoseconds
                 let token = messageProcessor.beginRequest()
                 do {
                     try await characteristicHandler.writeCommand(command, to: peripheral)
@@ -1445,7 +1471,12 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                     messageProcessor.reset()
                     throw error
                 }
-                let response = try await messageProcessor.awaitResponse(for: token, timeout: BLEConstants.defaultTimeout)
+                // Setup's budget includes the write/ack, not a fresh full window
+                // after each stage. Ordinary transaction timing stays unchanged.
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+                let remaining = responseTimeout.map { $0 - elapsed } ?? BLEConstants.defaultTimeout
+                guard remaining > 0 else { throw OBDMessageProcessorError.responseTimeout }
+                let response = try await messageProcessor.awaitResponse(for: token, timeout: remaining)
                 obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
                 return response
             } catch {

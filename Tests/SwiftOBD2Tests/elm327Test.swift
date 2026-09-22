@@ -40,7 +40,7 @@ final class ELM327Test: XCTestCase {
 //                XCTAssertEqual(sut.obdProtocol, .protocol6, "Expected obdProtocol to be .protocol6 but got \(String(describing: sut.obdProtocol))")
                 exp.fulfill()
             } catch {
-                print(error.localizedDescription)
+                XCTFail("Vehicle setup failed: \(error)")
                 exp.fulfill()
             }
         }

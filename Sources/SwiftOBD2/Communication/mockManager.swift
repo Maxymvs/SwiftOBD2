@@ -130,7 +130,7 @@ class MOCKComm: CommProtocol {
             let action = command.dropFirst(2)
             var response = {
                 switch action {
-                case " SH 7E0", "D", "L0", "AT1", "SP0", "SP6", "STFF", "S0":
+                case " SH 7E0", "D", "L0", "AT1", "SP0", "SP6", "TPA6", "STFF", "S0":
                     return ["OK"]
                 case "Z":
                     return ["ELM327 v1.5"]
@@ -147,7 +147,7 @@ class MOCKComm: CommProtocol {
                     ecuSettings.echo = false
                     return ["OK"]
                 case "DPN":
-                    return ["06"]
+                    return ["A6"]
                 case "RV":
                     return [String(Double.random(in: 12.0 ... 14.0))]
                 default:
