@@ -23,6 +23,7 @@ protocol CommProtocol {
     func startPeripheralScanning()
     func stopPeripheralScanning()
     var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> { get }
+    var peripheralDiscoveryPublisher: AnyPublisher<BLEPeripheralDiscovery, Never> { get }
 
     // MARK: - Bluetooth State
     var bluetoothState: CBManagerState { get }
@@ -77,6 +78,9 @@ extension CommProtocol {
     func stopPeripheralScanning() {}
     var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> {
         Empty<CBPeripheral, Never>().eraseToAnyPublisher()
+    }
+    var peripheralDiscoveryPublisher: AnyPublisher<BLEPeripheralDiscovery, Never> {
+        Empty<BLEPeripheralDiscovery, Never>().eraseToAnyPublisher()
     }
     var bluetoothState: CBManagerState { .unknown }
     func retrievePeripheral(uuid: UUID) -> CBPeripheral? { nil }
