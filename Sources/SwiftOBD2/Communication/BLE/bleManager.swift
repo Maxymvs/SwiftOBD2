@@ -101,6 +101,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     }
 
     private let peripheralSubject = PassthroughSubject<CBPeripheral, Never>()
+    private let peripheralDiscoverySubject = PassthroughSubject<BLEPeripheralDiscovery, Never>()
     // Replaced with centralized logging - see connectionStateDidChange for usage
 
     static let RestoreIdentifierKey: String = "OBD2Adapter"
@@ -563,7 +564,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     // MARK: - Central Manager Control Methods
 
-    func startScanning(_ serviceUUIDs: [CBUUID]?) {
+    func startScanning(_ serviceUUIDs: [CBUUID]?, reportingSignalUpdates: Bool = false) {
         guard centralManager.state == .poweredOn else { 
             obdWarning("Cannot start scanning - Bluetooth not powered on", category: .bluetooth)
             return 
@@ -571,8 +572,9 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         
         obdDebug("Starting BLE scan for services: \(serviceUUIDs?.map { $0.uuidString } ?? ["All"])", category: .bluetooth)
         
-        // Use allowDuplicates: false for better performance - we don't need duplicate discovery events
-        let scanOptions = [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        // Duplicates only for the user-facing picker, which needs live RSSI to rank devices by
+        // distance; reconnect scans just need the first sighting.
+        let scanOptions = [CBCentralManagerScanOptionAllowDuplicatesKey: reportingSignalUpdates]
         centralManager.scanForPeripherals(withServices: serviceUUIDs, options: scanOptions)
     }
 
@@ -656,6 +658,9 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     func didDiscover(_: CBCentralManager, peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         peripheralScanner.addDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: rssi)
         peripheralSubject.send(peripheral)
+        if let discovery = BLEPeripheralDiscovery(peripheral: peripheral, advertisementData: advertisementData, rssi: rssi) {
+            peripheralDiscoverySubject.send(discovery)
+        }
     }
 
     @discardableResult
@@ -1002,6 +1007,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         peripheralSubject.eraseToAnyPublisher()
     }
 
+    /// Advertisement sightings with RSSI, for ranking devices in a picker
+    var peripheralDiscoveryPublisher: AnyPublisher<BLEPeripheralDiscovery, Never> {
+        peripheralDiscoverySubject.eraseToAnyPublisher()
+    }
+
     /// Current CBManagerState for BT permission/power checking
     var bluetoothState: CBManagerState {
         centralManager.state
@@ -1015,7 +1025,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     /// Start scanning for peripherals and publish discoveries
     func startPeripheralScanning() {
-        startScanning(nil)
+        startScanning(nil, reportingSignalUpdates: true)
     }
 
     /// Stop peripheral scanning

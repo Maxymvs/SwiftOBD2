@@ -305,6 +305,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         elm327.commManager.discoveredPeripheralPublisher
     }
 
+    /// Advertisement sightings with RSSI and advertised services, for ranking an adapter picker
+    public var peripheralDiscoveryPublisher: AnyPublisher<BLEPeripheralDiscovery, Never> {
+        elm327.commManager.peripheralDiscoveryPublisher
+    }
+
     /// Enable/disable BLE-level auto-reconnect on unexpected disconnect
     public var autoReconnectEnabled: Bool {
         get { elm327.commManager.autoReconnectEnabled }
