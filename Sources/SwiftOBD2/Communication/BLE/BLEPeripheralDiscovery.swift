@@ -8,8 +8,9 @@ import Foundation
 /// unrelated Bluetooth devices.
 public struct BLEPeripheralDiscovery {
     public let peripheral: CBPeripheral
-    /// Received signal strength in dBm (always negative).
-    public let rssi: Int
+    /// Received signal strength in dBm, or nil when CoreBluetooth reports it as
+    /// unavailable (127). The advertisement's name and services still count.
+    public let rssi: Int?
     /// Name from the advertisement packet. Fresher than `peripheral.name`,
     /// which iOS may have cached from an earlier connection.
     public let advertisedName: String?
@@ -26,20 +27,24 @@ public struct BLEPeripheralDiscovery {
         Self.nonEmpty(advertisedName) ?? Self.nonEmpty(peripheral.name)
     }
 
-    init?(
+    init(
         peripheral: CBPeripheral,
         advertisementData: [String: Any],
         rssi: NSNumber,
         registry: BLEAdapterRegistry = .standard
     ) {
-        // 127 means "unavailable"; non-negative values are not real readings.
-        guard rssi.intValue < 0 else { return nil }
         let serviceUUIDs = Self.serviceUUIDs(fromAdvertisement: advertisementData)
         self.peripheral = peripheral
-        self.rssi = rssi.intValue
+        self.rssi = Self.signalStrength(fromRSSI: rssi)
         self.advertisedName = Self.nonEmpty(advertisementData[CBAdvertisementDataLocalNameKey] as? String)
         self.advertisedServiceUUIDs = serviceUUIDs
         self.advertisesSupportedAdapterService = Self.containsSupportedService(serviceUUIDs, registry: registry)
+    }
+
+    /// CoreBluetooth reports 127 for "RSSI unavailable"; real readings are negative dBm.
+    static func signalStrength(fromRSSI rssi: NSNumber) -> Int? {
+        let value = rssi.intValue
+        return value < 0 ? value : nil
     }
 
     static func serviceUUIDs(fromAdvertisement advertisementData: [String: Any]) -> [String] {

@@ -16,6 +16,12 @@ final class BLEPeripheralDiscoveryTests: XCTestCase {
         XCTAssertEqual(BLEPeripheralDiscovery.serviceUUIDs(fromAdvertisement: [:]), [])
     }
 
+    func testUnavailableRSSIBecomesUnknownSignalInsteadOfDroppingTheDiscovery() {
+        XCTAssertNil(BLEPeripheralDiscovery.signalStrength(fromRSSI: 127))
+        XCTAssertNil(BLEPeripheralDiscovery.signalStrength(fromRSSI: 0))
+        XCTAssertEqual(BLEPeripheralDiscovery.signalStrength(fromRSSI: -67), -67)
+    }
+
     func testSupportedServiceMatchesKnownAdapterProfiles() {
         XCTAssertTrue(BLEPeripheralDiscovery.containsSupportedService(["180A", "FFE0"], registry: .standard))
         XCTAssertTrue(BLEPeripheralDiscovery.containsSupportedService(["18F0"], registry: .standard))

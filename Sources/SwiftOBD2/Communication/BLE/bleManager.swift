@@ -658,9 +658,9 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     func didDiscover(_: CBCentralManager, peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         peripheralScanner.addDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: rssi)
         peripheralSubject.send(peripheral)
-        if let discovery = BLEPeripheralDiscovery(peripheral: peripheral, advertisementData: advertisementData, rssi: rssi) {
-            peripheralDiscoverySubject.send(discovery)
-        }
+        peripheralDiscoverySubject.send(
+            BLEPeripheralDiscovery(peripheral: peripheral, advertisementData: advertisementData, rssi: rssi)
+        )
     }
 
     @discardableResult
