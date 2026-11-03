@@ -79,6 +79,14 @@ public enum PROTOCOL: String, Codable, CaseIterable {
         }
     }
 
+    /// ISO 15765-4 and the user CAN protocols; J1939 (`A`) is CAN too but never speaks OBD-II.
+    var isCAN: Bool {
+        switch self {
+        case .protocol6, .protocol7, .protocol8, .protocol9, .protocolB, .protocolC: return true
+        default: return false
+        }
+    }
+
     var idBits: Int {
         switch self {
         case .protocol6, .protocol8, .protocolB: return 11

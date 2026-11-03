@@ -563,6 +563,23 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Parameter message: The raw command to send.
     /// - Returns: The raw response from the vehicle.
     /// - Throws: Errors that might occur during the request process.
+    private var adapterIdentityCache = AdapterIdentityCache()
+
+    /// What the connected adapter says it is (`ATI`, `AT@1`, `STI`). Call only while no other
+    /// command is in flight, after vehicle setup. Stops at the first silent command, which
+    /// never marks the connection failed; nil when nothing answered. Cached per BLE
+    /// peripheral for the app session (see `AdapterIdentityCache`).
+    @MainActor
+    public func adapterIdentity() async -> AdapterIdentity? {
+        let peripheralID = lastConnectedPeripheralUUID
+        if let cached = adapterIdentityCache.lookup(peripheralID) {
+            return cached
+        }
+        let probe = await elm327.probeAdapterIdentity()
+        adapterIdentityCache.store(probe, for: peripheralID, currentPeripheral: lastConnectedPeripheralUUID)
+        return probe.identity
+    }
+
     public func sendCommandInternal(_ message: String, retries: Int) async throws -> [String] {
         do {
             return try await elm327.sendCommand(message, retries: retries)

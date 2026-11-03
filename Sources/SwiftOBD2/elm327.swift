@@ -20,6 +20,10 @@ import OSLog
 
 enum ELM327Error: Error, LocalizedError {
     case noProtocolFound
+    /// A CAN vehicle answered `0100` but not with the legacy `41 00`, e.g. a negative response.
+    /// The bus is up but standard OBD-II Mode 01 isn't spoken, so probing other protocols is
+    /// pointless. Not proof of OBDonUDS (SAE J1979-2) — only that legacy OBD-II was refused.
+    case unsupportedDiagnosticDialect
     case invalidResponse(message: String)
     case adapterInitializationFailed
     case ignitionOff
@@ -32,6 +36,8 @@ enum ELM327Error: Error, LocalizedError {
         switch self {
         case .noProtocolFound:
             return "No compatible OBD protocol found."
+        case .unsupportedDiagnosticDialect:
+            return "The vehicle responded but doesn't support standard OBD-II requests."
         case let .invalidResponse(message):
             return "Invalid response received: \(message)"
         case .adapterInitializationFailed:
@@ -72,6 +78,9 @@ class ELM327 {
     }
 
     private var r100: [String] = []
+
+    /// The raw lines of the most recent `0100` probe, valid or not.
+    private var lastProbeResponse: [String] = []
 
     /// The vehicle the current session is talking to (its VIN when the adapter gave us one).
     var vehicleIdentifier: String?
@@ -151,14 +160,22 @@ class ELM327 {
 
         let supportedPIDs = await getSupportedPIDs()
 
-        guard let messages = try canProtocol?.parse(r100) else {
+        // An empty parse means no ECU produced a decodable 0100 answer; connecting anyway would
+        // report a vehicle with nothing it can do.
+        guard let messages = try canProtocol?.parse(r100), !messages.isEmpty else {
             throw ELM327Error.invalidResponse(message: "Invalid response to 0100")
         }
 
         let ecuMap = populateECUMap(messages)
 
         connectionState = .connectedToVehicle
-        return OBDInfo(vin: vin, supportedPIDs: supportedPIDs, obdProtocol: detectedProtocol, ecuMap: ecuMap)
+        return OBDInfo(
+            vin: vin,
+            supportedPIDs: supportedPIDs,
+            obdProtocol: detectedProtocol,
+            ecuMap: ecuMap,
+            responderHeaders: OBDInfo.responderHeaders(from: r100, obdProtocol: detectedProtocol)
+        )
     }
 
     // MARK: - Protocol Selection
@@ -180,6 +197,8 @@ class ELM327 {
         } else {
             do {
                 return try await detectProtocolAutomatically()
+            } catch ELM327Error.unsupportedDiagnosticDialect {
+                throw ELM327Error.unsupportedDiagnosticDialect
             } catch {
                 return try await detectProtocolManually()
             }
@@ -203,9 +222,23 @@ class ELM327 {
             throw ELM327Error.invalidResponse(message: "Invalid protocol number: \(obdProtocolNumber)")
         }
 
-        _ = await testProtocol(obdProtocol)
+        guard await testProtocol(obdProtocol) else {
+            if obdProtocol.isCAN, Self.containsFrame(lastProbeResponse) {
+                throw ELM327Error.unsupportedDiagnosticDialect
+            }
+            throw ELM327Error.noProtocolFound
+        }
 
         return obdProtocol
+    }
+
+    /// Whether any line is a raw bus frame (hex only) rather than adapter status text such as
+    /// `NO DATA`, `SEARCHING...` or `CAN ERROR`.
+    static func containsFrame(_ lines: [String]) -> Bool {
+        lines.contains { line in
+            let compact = line.replacingOccurrences(of: " ", with: "")
+            return compact.count >= 5 && compact.allSatisfy(\.isHexDigit)
+        }
     }
 
     /// Attempts to detect the OBD protocol manually.
@@ -233,6 +266,7 @@ class ELM327 {
     private func testProtocol(_ obdProtocol: PROTOCOL) async -> Bool {
         // test protocol by sending 0100 and checking for 41 00 response
         let response = try? await sendCommand("0100", retries: 3)
+        lastProbeResponse = response ?? []
 
         if let response = response,
            response.contains(where: { $0.range(of: #"41\s*00"#, options: .regularExpression) != nil }) {
@@ -275,6 +309,64 @@ class ELM327 {
         }
     }
 
+    /// The outcome of an identity probe. `completed` is false when cancellation cut it short,
+    /// so callers never cache a partial answer.
+    struct IdentityProbe {
+        let identity: AdapterIdentity?
+        let completed: Bool
+    }
+
+    /// Asks the adapter what it is: `ATI`, `AT@1`, `STI`, adapter-only commands that never
+    /// reach the car. Optional enrichment: one attempt each, stopping at the first command
+    /// that throws (silence, timeout) instead of spending a timeout on each. A `?` is an
+    /// immediate "unsupported", not a failure. Silence never marks the connection failed.
+    func probeAdapterIdentity() async -> IdentityProbe {
+        var answers: [String: String] = [:]
+        func identity() -> AdapterIdentity? {
+            guard !answers.isEmpty else { return nil }
+            return AdapterIdentity(
+                elmVersion: answers["ATI"],
+                deviceDescription: answers["AT@1"],
+                stnFirmware: AdapterIdentity.stnFirmware(from: answers["STI"])
+            )
+        }
+        for command in ["ATI", "AT@1", "STI"] {
+            if Task.isCancelled { return IdentityProbe(identity: nil, completed: false) }
+            do {
+                let lines = try await comm.sendOptionalCommand(command)
+                if let answer = AdapterIdentity.answer(to: command, lines: lines) {
+                    answers[command] = answer
+                }
+            } catch is CancellationError {
+                return IdentityProbe(identity: nil, completed: false)
+            } catch where Self.isIdentitySilence(error) {
+                // The adapter doesn't answer this one: a complete, cacheable outcome.
+                break
+            } catch {
+                // Disconnect, write failure or an unknown transport error: not an answer
+                // about the adapter, so never cached.
+                return IdentityProbe(identity: identity(), completed: false)
+            }
+        }
+        if Task.isCancelled { return IdentityProbe(identity: nil, completed: false) }
+        return IdentityProbe(identity: identity(), completed: true)
+    }
+
+    /// Silence or an explicit no-answer from the adapter, as opposed to a transport failure.
+    static func isIdentitySilence(_ error: Error) -> Bool {
+        let underlying = (error as? OBDServiceError).flatMap { serviceError -> Error? in
+            if case let .commandFailed(_, inner) = serviceError { return inner }
+            return nil
+        } ?? error
+        if BLEManager.commandCompatibilityFailure(for: underlying) == .adapterResponseTimedOut {
+            return true
+        }
+        if let managerError = underlying as? BLEManagerError, case .noData = managerError {
+            return true
+        }
+        return false
+    }
+
     private func setHeader(header: String) async throws {
         _ = try await okResponse("AT SH " + header)
     }
@@ -288,6 +380,7 @@ class ELM327 {
     func resetState() {
         canProtocol = nil
         r100 = []
+        lastProbeResponse = []
         vehicleIdentifier = nil
         // A new connection is a new vehicle until proven otherwise: never let the previous
         // (possibly VIN-less) car's advisory evidence apply to this one.
@@ -556,4 +649,20 @@ public struct OBDInfo: Codable, Hashable {
     public var supportedPIDs: [OBDCommand]?
     public var obdProtocol: PROTOCOL?
     public var ecuMap: [UInt8: ECUID]?
+    /// CAN response headers that answered the functional `0100` (e.g. 7E8, 7E9).
+    public var responderHeaders: [String]?
+
+    public init(
+        vin: String? = nil,
+        supportedPIDs: [OBDCommand]? = nil,
+        obdProtocol: PROTOCOL? = nil,
+        ecuMap: [UInt8: ECUID]? = nil,
+        responderHeaders: [String]? = nil
+    ) {
+        self.vin = vin
+        self.supportedPIDs = supportedPIDs
+        self.obdProtocol = obdProtocol
+        self.ecuMap = ecuMap
+        self.responderHeaders = responderHeaders
+    }
 }

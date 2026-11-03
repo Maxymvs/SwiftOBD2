@@ -13,6 +13,10 @@ import OSLog
 
 protocol CommProtocol {
     func sendCommand(_ command: String, retries: Int) async throws -> [String]
+    /// A single-attempt command whose silence is not a channel failure (optional adapter
+    /// identity queries). Transports that publish compatibility state must not mark the
+    /// connection failed when it times out.
+    func sendOptionalCommand(_ command: String) async throws -> [String]
     func disconnectPeripheral()
     func connectAsync(timeout: TimeInterval, peripheral: CBPeripheral?) async throws
     func scanForPeripherals() async throws
@@ -74,6 +78,10 @@ protocol CommProtocol {
 
 // Default no-op implementations for non-BLE managers
 extension CommProtocol {
+    func sendOptionalCommand(_ command: String) async throws -> [String] {
+        try await sendCommand(command, retries: 1)
+    }
+
     func startPeripheralScanning() {}
     func stopPeripheralScanning() {}
     var discoveredPeripheralPublisher: AnyPublisher<CBPeripheral, Never> {

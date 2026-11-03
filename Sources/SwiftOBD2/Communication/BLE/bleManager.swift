@@ -1362,6 +1362,38 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
     }
 
+    /// One attempt, under the same command mutex, for a command whose silence says nothing
+    /// about the channel (`ATI`/`AT@1`/`STI` identity queries). Only terminal channel
+    /// failures (disconnect, write failure, lost notifications) reach the compatibility
+    /// report; a timeout or cancellation leaves the verified report alone.
+    func sendOptionalCommand(_ command: String) async throws -> [String] {
+        let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        let acquired = await commandSemaphore.wait()
+        guard acquired else { throw CancellationError() }
+        defer { commandSemaphore.signal() }
+        do {
+            guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
+                throw CancellationError()
+            }
+            return try await sendCommandLocked(command, retries: 1)
+        } catch {
+            if Self.optionalCommandFailure(for: error) != nil {
+                publishCommandFailure(error, attempt: compatibilityAttempt)
+            }
+            throw error
+        }
+    }
+
+    /// The terminal failure an optional command may report: never a timeout or cancellation.
+    static func optionalCommandFailure(for error: Error) -> BLECompatibilityFailure? {
+        switch commandCompatibilityFailure(for: error) {
+        case .adapterResponseTimedOut, .cancelled, nil:
+            return nil
+        case let failure:
+            return failure
+        }
+    }
+
     /// The write-and-await body of `sendCommand`, with the command mutex **already held**.
     ///
     /// Split out so a multi-window transaction can send and then keep listening under a single
