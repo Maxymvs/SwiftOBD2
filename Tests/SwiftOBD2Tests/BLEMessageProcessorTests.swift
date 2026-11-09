@@ -72,7 +72,8 @@ final class BLEMessageProcessorTests: XCTestCase {
     func testUnclaimedRetentionIsBounded() async {
         let processor = BLEMessageProcessor()
 
-        let oversized = String(repeating: "7E8 02 43 00\r", count: 200)
+        let line = "7E8 02 43 00\r"
+        let oversized = String(repeating: line, count: BLEConstants.maxBufferSize / line.utf8.count + 10)
         processor.processReceivedData(Data((oversized + "\r>").utf8))
 
         let token = processor.beginContinuationRequest()

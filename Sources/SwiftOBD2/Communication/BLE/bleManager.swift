@@ -51,7 +51,11 @@ enum BLEConstants {
     static let scanDuration: TimeInterval = 10.0
     static let connectionTimeout: TimeInterval = 10.0
     static let retryDelay: TimeInterval = 0.5
-    static let maxBufferSize = 1024
+    /// Longest response kept before the prompt. A UDS DTC list can run to dozens of CAN frames
+    /// (about 20 characters each): a VW central electrics `19 02` reply overflowed the old 1024
+    /// and arrived with its start cut off (2026-11-05 capture). An ISO-TP message tops out at
+    /// 4095 bytes, roughly 12 KB of ELM text.
+    static let maxBufferSize = 16_384
     static let bluetoothPowerOnTimeout: TimeInterval = 30.0
     static let pollingInterval: UInt64 = 100_000_000 // 100ms in nanoseconds
 }
@@ -1343,6 +1347,13 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Serialized by `commandSemaphore` — only one command is in-flight at a time.
     /// Uses a deterministic 3-step protocol: `beginRequest()` → BLE write → `awaitResponse()`.
     func sendCommand(_ command: String, retries: Int = 3) async throws -> [String] {
+        try await sendCommand(command, retries: retries, responseTimeout: BLEConstants.defaultTimeout)
+    }
+
+    /// `sendCommand` with a caller-chosen wait for the adapter's `>` prompt. For exchanges a
+    /// module needs longer than the default to answer, e.g. a long `19 02` DTC list after a
+    /// "response pending" (`7F 19 78`).
+    func sendCommand(_ command: String, retries: Int, responseTimeout: TimeInterval) async throws -> [String] {
         let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
         let acquired = await commandSemaphore.wait()
         guard acquired else {
@@ -1355,7 +1366,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
                 throw CancellationError()
             }
-            return try await sendCommandLocked(command, retries: retries)
+            return try await sendCommandLocked(command, retries: retries, responseTimeout: responseTimeout)
         } catch {
             publishCommandFailure(error, attempt: compatibilityAttempt)
             throw error
@@ -1399,7 +1410,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Split out so a multi-window transaction can send and then keep listening under a single
     /// acquisition; `AsyncSemaphore` is not reentrant, so a transaction must never call
     /// `sendCommand` itself.
-    private func sendCommandLocked(_ command: String, retries: Int) async throws -> [String] {
+    private func sendCommandLocked(
+        _ command: String,
+        retries: Int,
+        responseTimeout: TimeInterval = BLEConstants.defaultTimeout
+    ) async throws -> [String] {
         try Task.checkCancellation()
 
         for attempt in 1...retries {
@@ -1421,7 +1436,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                     messageProcessor.reset()
                     throw error
                 }
-                let response = try await messageProcessor.awaitResponse(for: token, timeout: BLEConstants.defaultTimeout)
+                let response = try await messageProcessor.awaitResponse(for: token, timeout: responseTimeout)
                 obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
                 return response
             } catch {

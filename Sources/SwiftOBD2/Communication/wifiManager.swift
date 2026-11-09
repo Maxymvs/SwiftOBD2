@@ -13,6 +13,9 @@ import OSLog
 
 protocol CommProtocol {
     func sendCommand(_ command: String, retries: Int) async throws -> [String]
+    /// `sendCommand` with a longer wait for slow exchanges. Transports without a per-command
+    /// response timeout ignore it.
+    func sendCommand(_ command: String, retries: Int, responseTimeout: TimeInterval) async throws -> [String]
     /// A single-attempt command whose silence is not a channel failure (optional adapter
     /// identity queries). Transports that publish compatibility state must not mark the
     /// connection failed when it times out.
@@ -78,6 +81,10 @@ protocol CommProtocol {
 
 // Default no-op implementations for non-BLE managers
 extension CommProtocol {
+    func sendCommand(_ command: String, retries: Int, responseTimeout _: TimeInterval) async throws -> [String] {
+        try await sendCommand(command, retries: retries)
+    }
+
     func sendOptionalCommand(_ command: String) async throws -> [String] {
         try await sendCommand(command, retries: 1)
     }

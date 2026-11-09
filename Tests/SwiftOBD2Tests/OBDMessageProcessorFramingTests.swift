@@ -242,4 +242,23 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
         let lines = try await processor.awaitResponse(for: token, timeout: 1)
         XCTAssertEqual(lines.first, "7E8 02 43 00")
     }
+
+    /// A long multi-frame reply (60 CAN frames, ~1.2 KB of text) must arrive whole. The old
+    /// 1024-byte cap cleared the buffer mid-reply and delivered only the tail.
+    func testALongMultiFrameReplyArrivesWhole() async throws {
+        let processor = OBDMessageProcessor()
+        let frames = ["778037F1978", "77810FF5902FF000000"]
+            + (0..<60).map { String(format: "7782%XAAAAAAAAAAAAAA", ($0 + 1) % 16) }
+        let token = processor.beginRequest()
+        let text = frames.joined(separator: "\r") + "\r\r>"
+        // Delivered in 20-byte notifications, like BLE.
+        var offset = text.startIndex
+        while offset < text.endIndex {
+            let end = text.index(offset, offsetBy: 20, limitedBy: text.endIndex) ?? text.endIndex
+            processor.processReceivedData(Data(text[offset..<end].utf8))
+            offset = end
+        }
+        let lines = try await processor.awaitResponse(for: token, timeout: 1)
+        XCTAssertEqual(lines, frames)
+    }
 }

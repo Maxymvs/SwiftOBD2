@@ -588,6 +588,16 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         }
     }
 
+    /// A raw command with a longer wait for the adapter's answer, for slow module exchanges.
+    /// Bluetooth honors `responseTimeout`; other transports use their own read window.
+    public func sendCommandInternal(_ message: String, retries: Int, responseTimeout: TimeInterval) async throws -> [String] {
+        do {
+            return try await elm327.sendCommand(message, retries: retries, responseTimeout: responseTimeout)
+        } catch {
+            throw OBDServiceError.commandFailed(command: message, error: error)
+        }
+    }
+
     public func connectToPeripheral(peripheral: CBPeripheral) async throws {
         let compatibilityAttempt = compatibilityAttemptFence.begin()
         let bleManager = currentBLEManager
@@ -938,4 +948,14 @@ public struct VINInfo: Codable, Hashable {
     public let Model: String
     public let ModelYear: String
     public let EngineCylinders: String
+}
+
+extension OBDServiceError {
+    /// A raw command whose answer didn't arrive before the response timeout. The adapter may
+    /// still be receiving it, so a caller should let it finish before the next command.
+    public var isResponseTimeout: Bool {
+        guard case let .commandFailed(_, error) = self else { return false }
+        if case CommunicationError.timeout = error { return true }
+        return BLEManager.commandCompatibilityFailure(for: error) == .adapterResponseTimedOut
+    }
 }
