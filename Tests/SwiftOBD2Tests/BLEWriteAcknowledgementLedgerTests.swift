@@ -25,7 +25,7 @@ final class BLEWriteAcknowledgementLedgerTests: XCTestCase {
                 mode: .withResponse,
                 session: oldSession,
                 transport: transport,
-                deadline: 3
+                deadlineAt: ProcessInfo.processInfo.systemUptime + 60
             )
         }
         await waitForWrites(1, from: recorder)
@@ -47,7 +47,7 @@ final class BLEWriteAcknowledgementLedgerTests: XCTestCase {
                 mode: .withResponse,
                 session: newSession,
                 transport: newTransport,
-                deadline: 3
+                deadlineAt: ProcessInfo.processInfo.systemUptime + 60
             )
         }
         await waitForWrites(2, from: recorder)
@@ -95,7 +95,7 @@ final class BLEWriteAcknowledgementLedgerTests: XCTestCase {
                 mode: .withResponse,
                 session: oldSession,
                 transport: transport,
-                deadline: 3
+                deadlineAt: ProcessInfo.processInfo.systemUptime + 60
             )
         }
         await waitForWrites(1, from: recorder)
@@ -122,7 +122,7 @@ final class BLEWriteAcknowledgementLedgerTests: XCTestCase {
                 mode: .withResponse,
                 session: newSession,
                 transport: newTransport,
-                deadline: 3
+                deadlineAt: ProcessInfo.processInfo.systemUptime + 60
             )
         }
         await waitForWrites(2, from: recorder)

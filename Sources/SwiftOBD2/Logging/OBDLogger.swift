@@ -113,14 +113,21 @@ public class OBDLogger {
         info(message, category: .communication)
     }
     
-    /// Log parsing errors with context
+    /// Log parsing errors with context.
+    ///
+    /// Only `data`'s size is written, never its bytes: a malformed buffer can be a whole reply,
+    /// a VIN (`49 02`) or a manufacturer module's data among them.
     public func logParseError(_ errorMessage: String, data: Data, expectedFormat: String? = nil) {
-        let hexData = data.map { String(format: "%02X", $0) }.joined(separator: " ")
-        var message = "Parse error: \(errorMessage) | Data: \(hexData)"
+        error(Self.parseErrorMessage(errorMessage, byteCount: data.count, expectedFormat: expectedFormat), category: .parsing)
+    }
+
+    /// What `logParseError` writes: the reason and the byte count, no content.
+    static func parseErrorMessage(_ errorMessage: String, byteCount: Int, expectedFormat: String?) -> String {
+        var message = "Parse error: \(errorMessage) | \(byteCount == 1 ? "1 byte" : "\(byteCount) bytes")"
         if let format = expectedFormat {
             message += " | Expected: \(format)"
         }
-        error(message, category: .parsing)
+        return message
     }
     
     /// Log performance metrics

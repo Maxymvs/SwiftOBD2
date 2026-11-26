@@ -28,6 +28,13 @@ final class BLEAdapterValidationTests: XCTestCase {
             .cancelled
         )
         XCTAssertNil(BLEManager.commandCompatibilityFailure(for: BLEManagerError.noData))
+        // A stream no probe can prove reads, to the report, as the adapter not answering; a
+        // manufacturer exchange that merely didn't write says nothing about the channel.
+        XCTAssertEqual(
+            BLEManager.commandCompatibilityFailure(for: OBDStreamError.reconnectRequired),
+            .adapterResponseTimedOut
+        )
+        XCTAssertNil(BLEManager.commandCompatibilityFailure(for: OBDStreamError.unsynchronized))
         XCTAssertNil(BLEManager.commandCompatibilityFailure(for: BLEManagerError.adapterIdentificationRejected))
     }
 
@@ -495,5 +502,21 @@ final class BLEAdapterBindingCacheTests: XCTestCase {
         _ capabilities: BLECharacteristicCapabilities
     ) -> BLECharacteristicDescriptor {
         BLECharacteristicDescriptor(uuid: uuid, capabilities: capabilities)
+    }
+
+    /// "Reconnect required" is its own outcome for a caller: never a response timeout, whether
+    /// it ended a raw command or a clear.
+    func testReconnectRequiredIsNotAResponseTimeout() {
+        let command = OBDServiceError.commandFailed(command: "010C", error: OBDStreamError.reconnectRequired)
+        XCTAssertTrue(command.isReconnectRequired)
+        XCTAssertFalse(command.isResponseTimeout)
+        XCTAssertTrue(OBDServiceError.clearFailed(underlyingError: OBDStreamError.reconnectRequired).isReconnectRequired)
+
+        let timeout = OBDServiceError.commandFailed(command: "010C", error: BLEMessageProcessorError.responseTimeout)
+        XCTAssertTrue(timeout.isResponseTimeout)
+        XCTAssertFalse(timeout.isReconnectRequired)
+        XCTAssertFalse(
+            OBDServiceError.commandFailed(command: "010C", error: OBDStreamError.unsynchronized).isReconnectRequired
+        )
     }
 }

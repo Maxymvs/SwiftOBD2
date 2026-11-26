@@ -63,7 +63,12 @@ enum BLEWriteCoordinatorError: Error, Equatable, LocalizedError {
     case invalidMaximumWriteLength(Int)
     case invalidDeadline
     case emptyPayload
+    /// The deadline passed after at least one chunk was handed to the transport: a prefix of
+    /// the command may be on the wire.
     case deadlineExceeded
+    /// The deadline passed before the first chunk was handed to the transport: nothing of the
+    /// command was written.
+    case deadlineExceededBeforeWrite
     case channelPoisoned
     case acknowledgementFailed(String)
     case transportWriteFailed(String)
@@ -75,15 +80,54 @@ enum BLEWriteCoordinatorError: Error, Equatable, LocalizedError {
         case .writeInProgress: return "Another BLE write is already in progress."
         case let .invalidMaximumWriteLength(length):
             return "The peripheral reported an invalid BLE write length (\(length))."
-        case .invalidDeadline: return "The BLE write deadline must be finite and greater than zero."
+        case .invalidDeadline: return "The BLE write deadline must be finite and within the supported range."
         case .emptyPayload: return "The BLE write payload is empty."
         case .deadlineExceeded: return "The BLE write did not complete before its deadline."
+        case .deadlineExceededBeforeWrite: return "The BLE write could not start before its deadline."
         case .channelPoisoned: return "The BLE write channel must reconnect before another command can be sent."
         case let .acknowledgementFailed(message): return "The peripheral rejected a BLE write: \(message)"
         case let .transportWriteFailed(message): return "The BLE write failed: \(message)"
         }
     }
 }
+
+extension BLEWriteCoordinatorError {
+    /// The write ran out of time, with or without anything written.
+    var isDeadlineExpiry: Bool {
+        self == .deadlineExceeded || self == .deadlineExceededBeforeWrite
+    }
+
+    /// Whether this failure guarantees that **no byte** of the command reached the transport,
+    /// so the adapter can't answer it. False whenever that isn't certain.
+    var wroteNothing: Bool {
+        switch self {
+        case .noActiveSession, .writeInProgress, .invalidMaximumWriteLength, .invalidDeadline,
+             .emptyPayload, .deadlineExceededBeforeWrite, .channelPoisoned:
+            return true
+        case .sessionChanged, .deadlineExceeded, .acknowledgementFailed, .transportWriteFailed:
+            return false
+        }
+    }
+}
+
+/// Runs `submit` (the hand-off of a transfer's first chunk to the transport) only while what a
+/// bound command depends on still holds, atomically with whatever revokes it. Throws, without
+/// running `submit`, when it no longer holds. See `OBDWriteAuthorization.whileAuthorized`.
+typealias BLEFirstWriteGate = (_ submit: () throws -> Void) throws -> Void
+
+/// A transfer ended because its first-write gate refused: **nothing was written**, the write
+/// session is untouched, and `underlying` is the gate's own error (the binding's).
+struct BLEFirstWriteRefused: Error, LocalizedError {
+    let underlying: Error
+
+    var errorDescription: String? {
+        "Nothing was written: the command's binding refused the write (\(underlying.localizedDescription))."
+    }
+}
+
+/// The underlying error of a refusal by a gate that returned without running `submit` (a gate
+/// breaking its contract): nothing was handed over, so it is treated as a refusal.
+struct BLEFirstWriteGateSkippedSubmit: Error {}
 
 protocol BLEWriteDeadlineToken: AnyObject {
     func cancel()
@@ -127,18 +171,33 @@ private final class TaskDeadlineToken: BLEWriteDeadlineToken, @unchecked Sendabl
 /// from reserving or sending chunks out of order. Transport callbacks enqueue a
 /// later event, so a synchronous injected callback cannot re-enter the state
 /// machine while `write` is executing.
+///
+/// A write is bounded by one absolute, monotonic instant (`deadlineAt`, in `now()` seconds,
+/// `ProcessInfo.systemUptime` in production). Time spent queued before the executor reaches the
+/// write is charged to it, and the instant is checked immediately before every physical chunk
+/// write, so nothing reaches the adapter after the caller's cutoff.
+///
+/// A write may carry a first-write gate (a bound command: Mode 04 bound to one vehicle link).
+/// The hand-off of the transfer's **first** chunk to the transport then runs inside the gate, on
+/// the executor, after the deadline check and after any wait for flow control. A gate that
+/// refuses ends the transfer with nothing written (`BLEFirstWriteRefused`), the session usable.
+/// Later chunks are not gated: once a prefix is on the wire it can't be recalled.
 final class BLEWriteCoordinator: @unchecked Sendable {
     typealias Completion = (Result<Void, Error>) -> Void
+    /// The longest a write may still have left when it starts.
     static let maximumSupportedDeadline: TimeInterval = 3_600
 
     private struct Transfer {
         let id: UInt64
         let session: UInt64
         let mode: BLEWriteMode
+        let deadlineAt: TimeInterval
         let chunks: [Data]
         let transport: any BLEWriteTransport
         let cancellation: CancellationRegistration
         let completion: Completion
+        /// Consulted once, around the first chunk's hand-off. See `performPhysicalWrite`.
+        let firstWriteGate: BLEFirstWriteGate?
         var nextChunkIndex = 0
         var waitingForAcknowledgement = false
         var waitingForFlowControl = false
@@ -171,6 +230,7 @@ final class BLEWriteCoordinator: @unchecked Sendable {
     private let executor = DispatchQueue(label: "com.swiftobd2.ble-write-transport")
     private let executorKey = DispatchSpecificKey<UInt8>()
     private let deadlineScheduler: BLEWriteDeadlineScheduler
+    private let now: @Sendable () -> TimeInterval
 
     // Access only on `executor`.
     private var activeSession: UInt64?
@@ -179,8 +239,12 @@ final class BLEWriteCoordinator: @unchecked Sendable {
     private var activeTransfer: Transfer?
     private var poisonedSession: UInt64?
 
-    init(deadlineScheduler: BLEWriteDeadlineScheduler = .live) {
+    init(
+        deadlineScheduler: BLEWriteDeadlineScheduler = .live,
+        now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
         self.deadlineScheduler = deadlineScheduler
+        self.now = now
         executor.setSpecific(key: executorKey, value: 1)
     }
 
@@ -218,7 +282,8 @@ final class BLEWriteCoordinator: @unchecked Sendable {
         mode: BLEWriteMode,
         session: UInt64,
         transport: any BLEWriteTransport,
-        deadline: TimeInterval
+        deadlineAt: TimeInterval,
+        firstWriteGate: BLEFirstWriteGate? = nil
     ) async throws {
         let cancellation = CancellationRegistration()
 
@@ -230,8 +295,9 @@ final class BLEWriteCoordinator: @unchecked Sendable {
                         mode: mode,
                         session: session,
                         transport: transport,
-                        deadline: deadline,
-                        cancellation: cancellation
+                        deadlineAt: deadlineAt,
+                        cancellation: cancellation,
+                        firstWriteGate: firstWriteGate
                     ) { result in
                         continuation.resume(with: result)
                     }
@@ -300,15 +366,20 @@ final class BLEWriteCoordinator: @unchecked Sendable {
         mode: BLEWriteMode,
         session: UInt64,
         transport: any BLEWriteTransport,
-        deadline: TimeInterval,
+        deadlineAt: TimeInterval,
         cancellation: CancellationRegistration,
+        firstWriteGate: BLEFirstWriteGate?,
         completion: @escaping Completion
     ) {
         dispatchPrecondition(condition: .onQueue(executor))
         guard !payload.isEmpty else { completion(.failure(BLEWriteCoordinatorError.emptyPayload)); return }
-        guard deadline.isFinite, deadline > 0, deadline <= Self.maximumSupportedDeadline else {
+        let remaining = deadlineAt - now()
+        guard deadlineAt.isFinite, remaining <= Self.maximumSupportedDeadline else {
             completion(.failure(BLEWriteCoordinatorError.invalidDeadline)); return
         }
+        // The executor reached this write after the caller's instant (it sat queued behind other
+        // work). Nothing is written and nothing was, so the stream is untouched: no poisoning.
+        guard remaining > 0 else { completion(.failure(BLEWriteCoordinatorError.deadlineExceededBeforeWrite)); return }
 
         let maximumLength = transport.maximumWriteValueLength(for: mode)
         guard maximumLength > 0 else {
@@ -325,10 +396,12 @@ final class BLEWriteCoordinator: @unchecked Sendable {
             id: transferID,
             session: session,
             mode: mode,
+            deadlineAt: deadlineAt,
             chunks: payload.chunked(maximumLength: maximumLength),
             transport: transport,
             cancellation: cancellation,
-            completion: completion
+            completion: completion,
+            firstWriteGate: firstWriteGate
         )
 
         if cancellation.register(transferID: transferID) {
@@ -336,7 +409,8 @@ final class BLEWriteCoordinator: @unchecked Sendable {
             return
         }
 
-        let deadlineToken = deadlineScheduler.schedule(deadline) { [weak self] in
+        // What is left of the caller's budget, not a fresh interval from now.
+        let deadlineToken = deadlineScheduler.schedule(max(0, deadlineAt - now())) { [weak self] in
             self?.executor.async { [weak self] in self?.deadlineExpired(transferID: transferID) }
         }
         guard var transfer = activeTransfer, transfer.id == transferID else {
@@ -370,7 +444,6 @@ final class BLEWriteCoordinator: @unchecked Sendable {
             guard !transfer.waitingForAcknowledgement else { return }
             let chunk = transfer.chunks[transfer.nextChunkIndex]
             transfer.waitingForAcknowledgement = true
-            transfer.submittedChunkCount += 1
             activeTransfer = transfer
             performPhysicalWrite(chunk, transferID: transferID)
 
@@ -382,7 +455,6 @@ final class BLEWriteCoordinator: @unchecked Sendable {
             }
             let chunk = transfer.chunks[transfer.nextChunkIndex]
             transfer.nextChunkIndex += 1
-            transfer.submittedChunkCount += 1
             activeTransfer = transfer
             performPhysicalWrite(chunk, transferID: transferID)
             if activeTransfer?.id == transferID { schedulePump(transferID: transferID) }
@@ -391,24 +463,93 @@ final class BLEWriteCoordinator: @unchecked Sendable {
 
     private func performPhysicalWrite(_ chunk: Data, transferID: UInt64) {
         dispatchPrecondition(condition: .onQueue(executor))
-        guard let transfer = activeTransfer, transfer.id == transferID else { return }
-        do {
-            try transfer.transport.write(chunk, mode: transfer.mode)
-        } catch {
-            guard let latest = activeTransfer, latest.id == transferID else { return }
-            activeTransfer = nil
-            poisonedSession = latest.session
-            finish(
-                latest,
-                with: .failure(BLEWriteCoordinatorError.transportWriteFailed(error.localizedDescription))
-            )
+        guard var transfer = activeTransfer, transfer.id == transferID else { return }
+        // The last check before bytes leave: past the instant, this chunk is not written.
+        guard now() < transfer.deadlineAt else { deadlineExpired(transferID: transferID); return }
+
+        // The hand-off itself. Never throws: the transport's own error is captured, so it can't
+        // be mistaken for the gate refusing, nor a refusal for a transport failure.
+        var transportError: Error?
+        var submitted = false
+        let submit = { [self] in
+            if transfer.cancellation.cancelled { cancel(transferID: transferID); return }
+            guard now() < transfer.deadlineAt else { deadlineExpired(transferID: transferID); return }
+            transfer.submittedChunkCount += 1
+            activeTransfer = transfer
+            submitted = true
+            do {
+                try transfer.transport.write(chunk, mode: transfer.mode)
+            } catch {
+                transportError = error
+            }
         }
+
+        if transfer.submittedChunkCount == 0, let gate = transfer.firstWriteGate {
+            // The first chunk of a bound command goes out inside its gate, here on the executor,
+            // so a revocation of the binding is ordered against the hand-off itself (not against
+            // an earlier check that a flow-control wait could follow).
+            //
+            // LOCK RULE: the gate and `submit` run ON THE EXECUTOR. Neither may take, or wait
+            // for, any lock that a thread can hold while it waits for this executor:
+            // `BLECharacteristicHandler.reset` (and its other session invalidations) call
+            // `invalidateSession` (`executor.sync`) with the handler's `stateLock` held, and
+            // `BLEPeripheralManager` holds its `lifecycleLock` around that. Taking either here
+            // would deadlock. The vehicle-link record's lock is a leaf (nothing is done under it
+            // but this hand-off), so holding it here is fine; the transport's write only takes
+            // the acknowledgement ledger's leaf lock and hands the bytes to CoreBluetooth.
+            do {
+                try gate(submit)
+            } catch {
+                guard !submitted else {
+                    // A gate that throws after running `submit`: the bytes were handed over, so
+                    // the outcome is the transport's (below), never "nothing written".
+                    finishHandOff(transportError, transferID: transferID)
+                    return
+                }
+                // Refused before anything was handed over. Nothing written: the session is not
+                // poisoned and the stream is untouched.
+                guard let latest = activeTransfer, latest.id == transferID else { return }
+                activeTransfer = nil
+                finish(latest, with: .failure(BLEFirstWriteRefused(underlying: error)))
+                return
+            }
+            guard submitted else {
+                // A gate that returned without running `submit` handed nothing over either.
+                guard let latest = activeTransfer, latest.id == transferID else { return }
+                activeTransfer = nil
+                finish(latest, with: .failure(BLEFirstWriteRefused(underlying: BLEFirstWriteGateSkippedSubmit())))
+                return
+            }
+        } else {
+            submit()
+        }
+        finishHandOff(transportError, transferID: transferID)
     }
 
+    /// After any chunk was handed to the transport: a transport error poisons the session (a
+    /// prefix of the command may be on the wire), exactly as it always did.
+    private func finishHandOff(_ transportError: Error?, transferID: UInt64) {
+        dispatchPrecondition(condition: .onQueue(executor))
+        guard let transportError else { return }
+        guard let latest = activeTransfer, latest.id == transferID else { return }
+        activeTransfer = nil
+        poisonedSession = latest.session
+        finish(
+            latest,
+            with: .failure(BLEWriteCoordinatorError.transportWriteFailed(transportError.localizedDescription))
+        )
+    }
+
+    /// Poisons the session only once a chunk was submitted: a prefix of the command may then be
+    /// on the wire. With nothing submitted the stream is untouched and the session stays usable.
     private func deadlineExpired(transferID: UInt64) {
         dispatchPrecondition(condition: .onQueue(executor))
         guard let transfer = activeTransfer, transfer.id == transferID else { return }
         activeTransfer = nil
+        guard transfer.submittedChunkCount > 0 else {
+            finish(transfer, with: .failure(BLEWriteCoordinatorError.deadlineExceededBeforeWrite))
+            return
+        }
         poisonedSession = transfer.session
         finish(transfer, with: .failure(BLEWriteCoordinatorError.deadlineExceeded))
     }

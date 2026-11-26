@@ -77,6 +77,14 @@ class ELM327 {
         set { comm = newValue }
     }
 
+    /// Whether the transport is redacting its wire log (``CommProtocol/isWireRedactionHeld``).
+    var isWireRedactionHeld: Bool { comm.isWireRedactionHeld }
+
+    /// `lines` as an upper-layer log may show them: in full unless the transport holds redaction.
+    func replyLogText(_ lines: [String]) -> String {
+        OBDReplyLogText.render(lines, redactionHeld: isWireRedactionHeld)
+    }
+
     private var r100: [String] = []
 
     /// The raw lines of the most recent `0100` probe, valid or not.
@@ -219,7 +227,7 @@ class ELM327 {
         let obdProtocolNumber = try await sendCommand("ATDPN")
 
         guard let obdProtocol = PROTOCOL(rawValue: String(obdProtocolNumber[0].dropFirst())) else {
-            throw ELM327Error.invalidResponse(message: "Invalid protocol number: \(obdProtocolNumber)")
+            throw ELM327Error.invalidResponse(message: "Invalid protocol number (\(OBDReplyLogText.summary(obdProtocolNumber)))")
         }
 
         guard await testProtocol(obdProtocol) else {
@@ -397,22 +405,51 @@ class ELM327 {
         try await comm.sendCommand(message, retries: retries, responseTimeout: responseTimeout)
     }
 
-    private func okResponse(_ message: String) async throws -> [String] {
+    /// One send and as many write-free listen windows as `shouldContinueListening` asks for,
+    /// under one hold of the transport's command mutex. See `CommProtocol.sendCommandTransaction`.
+    func sendCommandTransaction(
+        _ message: String,
+        retries: Int,
+        responseTimeout: TimeInterval?,
+        shouldContinueListening: @escaping @Sendable ([String]) -> Bool,
+        listenDeadline: TimeInterval
+    ) async throws -> [String] {
+        try await comm.sendCommandTransaction(
+            message,
+            retries: retries,
+            responseTimeout: responseTimeout,
+            shouldContinueListening: shouldContinueListening,
+            listenDeadline: listenDeadline
+        )
+    }
+
+    func okResponse(_ message: String) async throws -> [String] {
         let response = try await sendCommand(message)
         if response.contains("OK") {
             return response
         } else {
-            logger.error("Invalid response: \(response)")
-            throw ELM327Error.invalidResponse(message: "message: \(message), \(String(describing: response.first))")
+            // Never the reply's text, held or not: while a manufacturer batch's late answer may
+            // still be on the stream, an unexpected reply to an adapter command can be that data.
+            let description = Self.unexpectedReplyDescription(command: message, lines: response)
+            logger.error("Invalid response to \(description)")
+            throw ELM327Error.invalidResponse(message: description)
         }
+    }
+
+    /// The command and a neutral description of what came back: no reply text.
+    static func unexpectedReplyDescription(command: String, lines: [String]) -> String {
+        "\(command): unexpected reply (\(OBDReplyLogText.summary(lines)))"
     }
 
     func getStatus() async throws -> Result<DecodeResult, DecodeError> {
         logger.info("Getting status")
         let statusCommand = OBDCommand.Mode1.status
         let statusResponse = try await sendCommand(statusCommand.properties.command)
-        logger.debug("Status response: \(statusResponse)")
-        guard let statusData = try canProtocol?.parse(statusResponse).first?.data else {
+        logger.debug("Status response: \(self.replyLogText(statusResponse))")
+        // Only a `41 01` answer is the status; a late reply to another PID is no status at all.
+        guard let statusData = try canProtocol?.parse(statusResponse)
+            .first(where: { OBDResponseOwnership.isPositiveResponse($0, to: statusCommand.properties.command) })?.data
+        else {
             return .failure(.noData)
         }
         return statusCommand.properties.decode(data: statusData)
@@ -425,9 +462,19 @@ class ELM327 {
     /// the request — or an adapter that answered nothing at all — looked exactly like a
     /// successful clear. A clear is now a success only when at least one responder returned a
     /// verified `44`; a refusal or an unverifiable response throws.
-    func clearTroubleCodes() async throws {
+    ///
+    /// - Parameter authorization: When set, the transport checks it with its command mutex held
+    ///   and hands the command's first bytes over inside it (see `OBDWriteAuthorization`); its
+    ///   error ends the clear with nothing sent. `OBDService.clearTroubleCodes(on:)` binds the
+    ///   clear to one vehicle link with it.
+    func clearTroubleCodes(authorization: OBDWriteAuthorization? = nil) async throws {
         let command = OBDCommand.Mode4.CLEAR_DTC
-        let response = try await sendCommand(command.properties.command)
+        let response: [String]
+        if let authorization {
+            response = try await comm.sendCommand(command.properties.command, retries: 1, authorization: authorization)
+        } else {
+            response = try await sendCommand(command.properties.command)
+        }
         switch DTCResponseParser.clearOutcome(lines: response, family: dtcProtocolFamily) {
         case .verified:
             obdInfo("Clear codes verified by a 44 positive response", category: .service)
@@ -450,7 +497,12 @@ class ELM327 {
             return nil
         }
 
-        guard let data = try? canProtocol?.parse(vinResponse).first?.data,
+        // Only a positive `49 02` answer carries the VIN. CAN `data` is `02 <count> <17 chars>`;
+        // legacy multi-frame `data` is the frames' data bytes with `49 02 <order>` already
+        // removed (leading `00` padding). Anything else (a late Mode 01 reply, `7F 09 12`, a
+        // `49 04` calibration id) is no VIN.
+        guard let data = try? canProtocol?.parse(vinResponse)
+            .first(where: { OBDResponseOwnership.isPositiveResponse($0, to: command.properties.command) })?.data,
               var vinString = String(bytes: data, encoding: .utf8)
         else {
             return nil
@@ -541,13 +593,16 @@ extension ELM327 {
                 // Ex.
                 //        || ||
                 // 7E8 06 41 00 BE 7F B8 13
-                guard let supportedPidsByECU = parseResponse(response) else {
+                guard let supportedPidsByECU = parseResponse(response, to: pidGetter.properties.command) else {
                     continue
                 }
 
+                // A bitmap marks commands of its own service only (`0100` → `01xx`, `0900` →
+                // `09xx`): matching on the PID alone let a Mode 01 bit mark `0902` or `0601`.
+                let service = String(pidGetter.properties.command.prefix(2))
+                let supportedRequests = Set(supportedPidsByECU.map { service + $0 })
                 let supportedCommands = OBDCommand.allCommands
-                    .filter { supportedPidsByECU.contains(String($0.properties.command.dropFirst(2))) }
-                    .map { $0 }
+                    .filter { supportedRequests.contains($0.properties.command) }
 
                 supportedPIDs.append(contentsOf: supportedCommands)
             } catch {
@@ -561,24 +616,53 @@ extension ELM327 {
         return Array(Set(supportedPIDs))
     }
 
-    private func parseResponse(_ response: [String]) -> Set<String>? {
-        guard let ecuData = try? canProtocol?.parse(response).first?.data else {
+    /// The bitmap of the positive answer to `command` (`41 00` for `0100`, `49 00` for `0900`),
+    /// never another reply's bytes read as one.
+    ///
+    /// The bitmap covers the 32 PIDs after the request's own PID (its base): `0100` → 01–20,
+    /// `0120` → 21–40, `0640` → 41–60. It is exactly the four bytes after the echoed PID; a reply
+    /// declaring fewer is no bitmap, and nothing after the four is read.
+    private func parseResponse(_ response: [String], to command: String) -> Set<String>? {
+        guard let base = OBDResponseOwnership.request(command)?.pid,
+              let ecuData = try? canProtocol?.parse(response)
+              .first(where: { OBDResponseOwnership.isPositiveResponse($0, to: command) })?.data,
+              ecuData.count >= 5
+        else {
             return nil
         }
-        let binaryData = BitArray(data: ecuData.dropFirst()).binaryArray
-        return extractSupportedPIDs(binaryData)
+        let binaryData = BitArray(data: ecuData.dropFirst().prefix(4)).binaryArray
+        return extractSupportedPIDs(binaryData, base: base)
     }
 
-    func extractSupportedPIDs(_ binaryData: [Int]) -> Set<String> {
+    /// The PIDs (two hex digits) whose bits are set, bit `i` (0-based) being PID `base + i + 1`.
+    func extractSupportedPIDs(_ binaryData: [Int], base: UInt8 = 0) -> Set<String> {
         var supportedPIDs: Set<String> = []
 
         for (index, value) in binaryData.enumerated() {
-            if value == 1 {
-                let pid = String(format: "%02X", index + 1)
-                supportedPIDs.insert(pid)
+            let pid = Int(base) + index + 1
+            if value == 1, pid <= 0xFF {
+                supportedPIDs.insert(String(format: "%02X", pid))
             }
         }
         return supportedPIDs
+    }
+}
+
+/// Renders reply lines for upper-layer logs (above the transport's own `OBDWireLog`).
+///
+/// While the transport holds redaction, a reply to an ordinary command can be a manufacturer
+/// batch's late answer, so only a neutral summary is rendered. A reply that carries a VIN (`49 02`
+/// or `62 F1 90`, e.g. a late `0902` or `22F190` answer in another command's slot) is never
+/// rendered either: the same check as the wire log (`OBDWireLog.isIdentifying`). Error messages
+/// never embed reply text, held or not: they use `summary`.
+enum OBDReplyLogText {
+    static func render(_ lines: [String], redactionHeld: Bool) -> String {
+        redactionHeld || OBDWireLog.isIdentifying(command: nil, lines: lines) ? summary(lines) : "\(lines)"
+    }
+
+    /// How many lines came back, never what they said.
+    static func summary(_ lines: [String]) -> String {
+        lines.count == 1 ? "1 reply line" : "\(lines.count) reply lines"
     }
 }
 
@@ -593,7 +677,13 @@ struct BatchedResponse {
     mutating func extractValue(_ cmd: OBDCommand) -> MeasurementResult? {
         let properties = cmd.properties
         let size = properties.bytes
-        guard response.count >= size else { return nil }
+        // A batched reply carries `<PID> <value bytes>` for each PID the ECU answered, in order;
+        // it leaves out PIDs it doesn't support. Decode only a PID that is echoed here, and don't
+        // consume bytes for one that isn't, so an omitted or misattributed PID never reads
+        // another PID's bytes.
+        guard size >= 1, let pid = OBDResponseOwnership.request(properties.command)?.pid,
+              response.first == pid, response.count >= size
+        else { return nil }
         let valueData = response.prefix(size)
 
         response.removeFirst(size)

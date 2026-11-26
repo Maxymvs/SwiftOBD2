@@ -113,10 +113,45 @@ class BLECharacteristicHandler {
         peripheral.discoverCharacteristics(profile.characteristicUUIDs.map(CBUUID.init(string:)), for: service)
     }
 
+    /// The write session commands to `peripheral` would go out on now: nil unless the handler is
+    /// configured for that exact peripheral object and ready (the conditions `writeCommand`
+    /// checks). A caller that captures it when it resolves a target can pass it back to
+    /// `writeCommand`, so the command can't be written on a later session.
+    func currentWriteSession(for peripheral: CBPeripheral) -> UInt64? {
+        stateLock.withLock {
+            guard configuredPeripheral === peripheral,
+                  ecuWriteCharacteristic != nil,
+                  writeType != nil,
+                  let writeSession,
+                  notificationReadiness.isReady else { return nil }
+            return writeSession
+        }
+    }
+
+    /// Writes `command` and waits for the write to be accepted (flow control or acknowledgement).
+    ///
+    /// - Parameters:
+    ///   - session: The write session the caller captured when it resolved its target
+    ///     (`currentWriteSession(for:)`). When set and no longer the current one, throws
+    ///     `BLEWriteCoordinatorError.sessionChanged` without encoding or writing; otherwise the
+    ///     coordinator re-checks it on its executor before any chunk. Nil: the current session.
+    ///   - deadlineAt: Absolute, monotonic instant (`ProcessInfo.systemUptime` seconds) after
+    ///     which no chunk is written. Already past when the write starts: throws
+    ///     `BLEWriteCoordinatorError.deadlineExceededBeforeWrite` without writing. Passing it once
+    ///     a chunk was submitted: throws `.deadlineExceeded` and poisons the write session.
+    ///   - firstWriteGate: For a bound command only (never a probe). The hand-off of the first
+    ///     chunk runs inside it on the write coordinator's executor; when it refuses, nothing is
+    ///     written and `BLEFirstWriteRefused` is thrown. It must not take `stateLock` (see
+    ///     `BLEWriteCoordinator.performPhysicalWrite`).
+    ///
+    /// Logs nothing about the command: the caller records the exchange through the wire log,
+    /// which applies the exchange's logging policy.
     func writeCommand(
         _ command: String,
         to peripheral: CBPeripheral,
-        deadline: TimeInterval = BLEConstants.defaultTimeout
+        session expectedSession: UInt64? = nil,
+        deadlineAt: TimeInterval,
+        firstWriteGate: BLEFirstWriteGate? = nil
     ) async throws {
         let configuration = stateLock.withLock { () -> (
             CBCharacteristic,
@@ -138,6 +173,10 @@ class BLECharacteristicHandler {
                 maximumProfileChunkLength
             )
         }
+        if let expectedSession, configuration?.2 != expectedSession {
+            // Resolved on a session that is gone: never written on whatever replaced it.
+            throw BLEWriteCoordinatorError.sessionChanged
+        }
         guard let (characteristic, writeType, session, terminator, profileMaximum) = configuration else {
             throw BLEManagerError.missingPeripheralOrCharacteristic
         }
@@ -156,9 +195,9 @@ class BLECharacteristicHandler {
             mode: writeType.writeMode,
             session: session,
             transport: transport,
-            deadline: deadline
+            deadlineAt: deadlineAt,
+            firstWriteGate: firstWriteGate
         )
-        logger.info("Sent command: \(command)")
     }
 
     func handleUpdatedValue(_ data: Data, from characteristic: CBCharacteristic) {
@@ -173,9 +212,9 @@ class BLECharacteristicHandler {
             return true
         }
         guard handled else {
-            if let responseString = String(data: data, encoding: .utf8) {
-                logger.info("Unknown characteristic: \(characteristic)\nResponse: \(responseString)")
-            }
+            // These bytes may be a late manufacturer answer arriving after the channel was torn
+            // down and the redaction hold released, so only their count is logged, never content.
+            messageProcessor.wireLog.record(.unclaimedBytes(byteCount: data.count))
             return
         }
     }

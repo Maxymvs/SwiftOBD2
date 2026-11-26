@@ -55,6 +55,23 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// Cached peripheral name from last successful connection
     public private(set) var latestConnectedPeripheralName: String?
 
+    /// The vehicle link that is up right now, with the VIN read while setting it up. Unlike
+    /// `latestOBDInfo` it never outlives its link: it is cleared when a setup starts and
+    /// whenever the service leaves `.connectedToVehicle`, and a new id is minted by every
+    /// successful setup. So a VIN taken from here was read on this link, never on an earlier
+    /// one. Only a setup that still owns the connection publishes it, in the same main-actor
+    /// operation that checks the ownership. Written on the main actor only.
+    ///
+    /// The record carries the transport's connection identity it was published on, and this
+    /// getter compares it with the transport's identity now. The transport invalidates that
+    /// identity itself, the moment the connection goes away, so a link never outlives its
+    /// connection even before the state change that clears the record reaches the main queue.
+    public var vehicleLink: OBDVehicleLink? { vehicleLinkRecord.currentLink(adapter: elm327) }
+
+    /// Backs `vehicleLink`, with the adapter connection it was published on, so a bound request
+    /// can check it with the transport's command mutex held (`clearTroubleCodes(on:)`).
+    private let vehicleLinkRecord = OBDVehicleLinkRecord()
+
     @Published public var connectionType: ConnectionType {
         didSet {
             switchConnectionType(connectionType)
@@ -93,12 +110,25 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         bindCompatibilityReporting()
     }
 
+    /// Test seam: a service over a given transport.
+    init(comm: CommProtocol, connectionType: ConnectionType) {
+        self.connectionType = connectionType
+        elm327 = ELM327(comm: comm)
+        elm327.obdDelegate = self
+        bindCompatibilityReporting()
+    }
+
+    /// Test seam: awaited by a setup after its last ownership check, right before it publishes
+    /// its result. Lets a test hold one setup there while another takes over. Nil in production.
+    var vehicleSetupWillPublish: (() async -> Void)?
+
     // MARK: - Connection Handling
 
     public func connectionStateChanged(state: ConnectionState) {
         DispatchQueue.main.async {
             let oldState = self.connectionState
             self.connectionState = state
+            if state != .connectedToVehicle { self.vehicleLinkRecord.clear() }
             if oldState != state {
                 OBDLogger.shared.logConnectionChange(from: oldState, to: state)
             }
@@ -112,17 +142,23 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Throws: Errors that might occur during the connection process.
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7, peripheral: CBPeripheral? = nil) async throws -> OBDInfo {
         let compatibilityAttempt = compatibilityAttemptFence.begin()
+        let adapter = elm327
         let bleManager = currentBLEManager
         var managerAttempt: UInt64?
+        var adapterConnection = OBDAdapterConnectionSnapshot.none
         let startTime = CFAbsoluteTimeGetCurrent()
         var connectionStage = OBDConnectionStage.adapterTransport
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
+        await MainActor.run { self.vehicleLinkRecord.clear() }
 
         do {
             obdDebug("Connecting to adapter...", category: .connection)
             try await elm327.connectToAdapter(timeout: timeout, peripheral: peripheral)
+            // The connection this setup runs on: the attempt and the physical peripheral, read
+            // together. The link is published only while the transport is still on it.
+            adapterConnection = adapter.commManager.adapterConnection
             if let bleManager {
-                let activeManagerAttempt = bleManager.currentCompatibilityAttemptToken
+                let activeManagerAttempt = adapterConnection.attempt ?? bleManager.currentCompatibilityAttemptToken
                 managerAttempt = activeManagerAttempt
                 try ensureCurrentCompatibilityAttempt(
                     compatibilityAttempt,
@@ -190,17 +226,22 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
-            obdInfo("Successfully connected to vehicle: \(vehicleInfo.vin ?? "Unknown")", category: .connection)
+            // Never the VIN itself: it identifies the owner's car.
+            obdInfo("Successfully connected to vehicle (VIN \(vehicleInfo.vin == nil ? "not reported" : "read"))", category: .connection)
 
+            await vehicleSetupWillPublish?()
             // Cache connection metadata (overwrite with fresh data)
-            await MainActor.run {
-                self.latestOBDInfo = vehicleInfo
+            let owner = VehicleSetupOwner(serviceAttempt: compatibilityAttempt, adapter: adapter, connection: adapterConnection)
+            let published = await MainActor.run { () -> Bool in
+                guard self.publishVehicleSetup(vehicleInfo, owner: owner) else { return false }
                 // Only overwrite peripheral name when a peripheral was explicitly provided;
                 // a nil peripheral (scan-based connect) should not wipe a previously cached name.
                 if let name = peripheral?.name {
                     self.latestConnectedPeripheralName = name
                 }
+                return true
             }
+            guard published else { throw CancellationError() }
 
             return vehicleInfo
         } catch {
@@ -226,6 +267,49 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     func initializeVehicle(_ preferedProtocol: PROTOCOL?) async throws -> OBDInfo {
         let obd2info = try await elm327.setupVehicle(preferredProtocol: preferedProtocol)
         return obd2info
+    }
+
+    /// What a setup must still own when it publishes: its service attempt, the ELM327 (and so
+    /// the transport) it ran on, and the adapter connection it captured.
+    private struct VehicleSetupOwner {
+        let serviceAttempt: UInt64
+        let adapter: ELM327
+        let connection: OBDAdapterConnectionSnapshot
+    }
+
+    /// Publishes a finished setup's `latestOBDInfo` and link, in one main-actor operation that
+    /// first checks the setup still owns the connection: no newer setup began, the transport is
+    /// the same, and it is still on the captured attempt and peripheral. A setup that lost
+    /// ownership publishes nothing and leaves the newer setup's link alone. Returns whether it
+    /// published.
+    @MainActor
+    private func publishVehicleSetup(_ info: OBDInfo, owner: VehicleSetupOwner) -> Bool {
+        guard compatibilityAttemptFence.isCurrent(owner.serviceAttempt),
+              elm327 === owner.adapter,
+              owner.adapter.commManager.adapterConnection == owner.connection else {
+            obdInfo("A superseded connection setup finished; publishing nothing", category: .connection)
+            return false
+        }
+        latestOBDInfo = info
+        recordVehicleLink(info, owner: owner)
+        return true
+    }
+
+    /// Mints the link record for a setup that just succeeded. Main actor only. Skipped when
+    /// the link already dropped again (state changes are delivered on the main queue in order,
+    /// so a drop that happened first has been seen by now). The adapter is the peripheral the
+    /// setup connected to, never the app's saved reconnect target.
+    @MainActor
+    private func recordVehicleLink(_ info: OBDInfo, owner: VehicleSetupOwner) {
+        guard connectionState == .connectedToVehicle else {
+            vehicleLinkRecord.clear()
+            return
+        }
+        vehicleLinkRecord.publish(
+            OBDVehicleLink(id: UUID(), vin: info.vin, adapterID: owner.connection.peripheralID),
+            adapter: owner.adapter,
+            connection: owner.connection
+        )
     }
 
     /// Clears cached connection metadata synchronously.
@@ -337,10 +421,15 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// BLE is already connected — only runs adapter init + vehicle setup.
     public func reinitializeConnection(preferedProtocol: PROTOCOL? = nil) async throws -> OBDInfo {
         let compatibilityAttempt = compatibilityAttemptFence.begin()
+        let adapter = elm327
         let bleManager = currentBLEManager
-        let managerAttempt = bleManager?.currentCompatibilityAttemptToken
+        // The connection this reinitialization runs on: the attempt and the physical peripheral,
+        // read together.
+        let adapterConnection = adapter.commManager.adapterConnection
+        let managerAttempt = bleManager.map { adapterConnection.attempt ?? $0.currentCompatibilityAttemptToken }
         var connectionStage = OBDConnectionStage.adapterInitialization
         obdInfo("Reinitializing connection (BLE already connected)...", category: .connection)
+        await MainActor.run { self.vehicleLinkRecord.clear() }
         do {
             if let bleManager, let managerAttempt {
                 bleManager.recordAdapterInitializationStarted(expectedAttempt: managerAttempt)
@@ -381,11 +470,12 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                 )
             }
 
+            await vehicleSetupWillPublish?()
             // Cache connection metadata (overwrite with fresh data)
-            await MainActor.run {
-                self.latestOBDInfo = vehicleInfo
-                // Peripheral name unchanged on reinit — preserve existing cache
-            }
+            // Peripheral name unchanged on reinit — preserve existing cache
+            let owner = VehicleSetupOwner(serviceAttempt: compatibilityAttempt, adapter: adapter, connection: adapterConnection)
+            let published = await MainActor.run { self.publishVehicleSetup(vehicleInfo, owner: owner) }
+            guard published else { throw CancellationError() }
 
             return vehicleInfo
         } catch {
@@ -446,14 +536,66 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Throws: Errors that might occur during the request process.
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit, retries: Int = 3) async throws -> [OBDCommand: MeasurementResult] {
         let boundedRetries = max(1, retries)
+        // Some fuel trims carry an optional second bank. A combined reply has no length
+        // for each PID, so that bank's value could look like the next PID. Read those
+        // trims singly unless this vehicle's oxygen-sensor layout is known.
+        guard commands.count > 1, commands.contains(where: Self.hasOptionalTrimByte) else {
+            return try await requestPIDGroup(commands, unit: unit, retries: boundedRetries)
+        }
+
+        let fixedWidth = commands.filter { !Self.hasOptionalTrimByte($0) }
+        var readings: [OBDCommand: MeasurementResult] = [:]
+        if !fixedWidth.isEmpty {
+            readings = try await requestPIDGroup(fixedWidth, unit: unit, retries: boundedRetries)
+        }
+        for command in commands where Self.hasOptionalTrimByte(command) {
+            let reading = try await requestPIDGroup([command], unit: unit, retries: boundedRetries)
+            readings[command] = reading[command]
+        }
+        return readings
+    }
+
+    private func requestPIDGroup(
+        _ commands: [OBDCommand], unit: MeasurementUnit, retries: Int
+    ) async throws -> [OBDCommand: MeasurementResult] {
         let response = try await sendCommandInternal(
             "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined(),
-            retries: boundedRetries
+            retries: retries
         )
 
-        guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-            obdDebug("requestPIDs: parse returned nil (canProtocol=\(elm327.canProtocol != nil ? "set" : "nil"), response=\(response))", category: .communication)
+        guard let results = try Self.decodePIDResponse(response, commands: commands, parser: elm327.canProtocol, unit: unit) else {
+            obdDebug("requestPIDs: parse returned nil (canProtocol=\(elm327.canProtocol != nil ? "set" : "nil"), response=\(elm327.replyLogText(response)))", category: .communication)
             return [:]
+        }
+
+        return results
+    }
+
+    private static func hasOptionalTrimByte(_ command: OBDCommand) -> Bool {
+        switch command {
+        case .mode1(.shortFuelTrim1), .mode1(.longFuelTrim1), .mode1(.shortFuelTrim2), .mode1(.longFuelTrim2),
+             .mode1(.shortO2TrimB1), .mode1(.longO2TrimB1), .mode1(.shortO2TrimB2), .mode1(.longO2TrimB2):
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Decodes the reply to a batched Mode 01 request. Nil when no responder answered `41`.
+    ///
+    /// Only a positive Mode 01 response is decoded, and inside it only the PIDs it echoes
+    /// (``BatchedResponse/extractValue(_:)``): a late reply to another request that landed in
+    /// this slot (`41 0C …` for `010D`, a `7F`, a `49 02 …`) gives no value, never a number.
+    static func decodePIDResponse(
+        _ response: [String],
+        commands: [OBDCommand],
+        parser: CANProtocol?,
+        unit: MeasurementUnit
+    ) throws -> [OBDCommand: MeasurementResult]? {
+        guard let responseData = try parser?.parse(response)
+            .first(where: { OBDResponseOwnership.isPositiveResponse($0, service: 0x01, pid: nil) })?.data
+        else {
+            return nil
         }
 
         var batchedResponse = BatchedResponse(response: responseData, unit)
@@ -473,13 +615,36 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     public func sendCommand(_ command: OBDCommand) async throws -> Result<DecodeResult, DecodeError> {
         do {
             let response = try await sendCommandInternal(command.properties.command, retries: 3)
-            guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-                return .failure(.noData)
-            }
-            return command.properties.decode(data: responseData.dropFirst())
+            return try Self.decodeCommandResponse(response, command: command, parser: elm327.canProtocol)
         } catch {
             throw OBDServiceError.commandFailed(command: command.properties.command, error: error)
         }
+    }
+
+    /// Decodes the reply to one `sendCommand(_:)` request: only a message that is the positive
+    /// response to the command's service (`41`/`43`/`46`/`49`) and echoes its PID/MID/InfoType
+    /// (Modes 01, 06, 09) is decoded. Anything else, including adapter commands, is `.noData`.
+    static func decodeCommandResponse(
+        _ response: [String],
+        command: OBDCommand,
+        parser: CANProtocol?
+    ) throws -> Result<DecodeResult, DecodeError> {
+        let request = command.properties.command
+        guard let responseData = try parser?.parse(response)
+            .first(where: { OBDResponseOwnership.isPositiveResponse($0, to: request) })?.data
+        else {
+            return .failure(.noData)
+        }
+        if OBDResponseOwnership.request(request)?.service == 0x01 {
+            // Mode 01: `responseData` is `<PID> <value…>`, trimmed to the length the reply
+            // declares, and the decoder drops the PID itself. A reply too short to carry the
+            // whole value is no value: it must never decode as a zero (CAN padding used to be
+            // read as the measurement).
+            let size = command.properties.bytes
+            guard size >= 1, responseData.count >= size else { return .failure(.noData) }
+            return command.properties.decode(data: responseData.prefix(size))
+        }
+        return command.properties.decode(data: responseData.dropFirst())
     }
 
     /// Sends an OBD2 command to the vehicle and returns the raw response.
@@ -532,13 +697,39 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         return true
     }
 
-    /// Clears the trouble codes found on the vehicle.
+    /// Clears the trouble codes found on the vehicle, on whatever link is up when the command
+    /// reaches the transport. Production clears use the bound form, `clearTroubleCodes(on:)`.
     ///  - Throws: Errors that might occur during the request process.
     ///     - `OBDServiceError.clearFailed` when the vehicle refused the request or no `44`
     ///       positive response could be verified — a failed clear no longer looks successful.
     public func clearTroubleCodes() async throws {
         do {
             try await elm327.clearTroubleCodes()
+        } catch {
+            throw OBDServiceError.clearFailed(underlyingError: error)
+        }
+    }
+
+    /// Mode 04 on exactly this link. Throws `OBDVehicleLinkError.linkChanged` when `link` is no
+    /// longer the service's current vehicle link; nothing is sent.
+    ///
+    /// The link is checked with the transport's command mutex held when the attempt starts and
+    /// again once the stream is proven ("current" there means: `vehicleLink` is this link, and
+    /// the transport is still on the adapter connection the link was published on). What makes
+    /// it safe is the third check: the hand-off of `04`'s first bytes to the system runs inside
+    /// the link record's lock, after checking under that lock that `link` is still the
+    /// published one. Every revocation takes the same lock, so a write that was queued (behind
+    /// Bluetooth flow control, behind a socket) never goes out on a revoked link. See
+    /// `OBDVehicleLinkRecord.authorization(for:adapter:)`. Other failures map as in
+    /// `clearTroubleCodes()`, to `OBDServiceError.clearFailed`.
+    public func clearTroubleCodes(on link: OBDVehicleLink) async throws {
+        let adapter = elm327
+        do {
+            try await adapter.clearTroubleCodes(
+                authorization: vehicleLinkRecord.authorization(for: link, adapter: adapter)
+            )
+        } catch let error as OBDVehicleLinkError {
+            throw error
         } catch {
             throw OBDServiceError.clearFailed(underlyingError: error)
         }
@@ -596,6 +787,46 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         } catch {
             throw OBDServiceError.commandFailed(command: message, error: error)
         }
+    }
+
+    /// A raw command sent once, as one exclusive transaction: while `continueListeningWhile`
+    /// says the lines so far still owe a final answer (a module answered "response pending",
+    /// `7F … 78`, and the adapter returned to its prompt), the transport keeps listening without
+    /// writing again, holding its command mutex, for at most `listenDeadline` seconds in total.
+    ///
+    /// Returns every line received. If the exchange ends while `continueListeningWhile` still
+    /// says an answer is owed (the budget ran out, the adapter said `NO DATA`, the caller was
+    /// cancelled), the transport marks its stream as needing resynchronization before the next
+    /// write, so the late answer can never be taken for the next command's.
+    ///
+    /// - Parameter responseTimeout: The wait for the first answer; nil uses the transport's
+    ///   default. Bluetooth honors it; other transports use their own read window.
+    public func sendCommandInternal(
+        _ message: String,
+        retries: Int,
+        responseTimeout: TimeInterval?,
+        continueListeningWhile: @escaping @Sendable ([String]) -> Bool,
+        listenDeadline: TimeInterval
+    ) async throws -> [String] {
+        do {
+            return try await elm327.sendCommandTransaction(
+                message,
+                retries: retries,
+                responseTimeout: responseTimeout,
+                shouldContinueListening: continueListeningWhile,
+                listenDeadline: listenDeadline
+            )
+        } catch {
+            throw OBDServiceError.commandFailed(command: message, error: error)
+        }
+    }
+
+    /// Whether the adapter's stream can no longer be proven in sync on this connection: an
+    /// earlier command's answer may still arrive, and every probe that could rule that out has
+    /// gone unanswered itself. Commands fail without being sent until the adapter is
+    /// reconnected (the reconnect resets it). Waiting does not clear this.
+    public var isAdapterReconnectRequired: Bool {
+        elm327.commManager.requiresReconnect
     }
 
     public func connectToPeripheral(peripheral: CBPeripheral) async throws {
@@ -693,6 +924,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     private var currentBLEManager: BLEManager? {
         elm327.commManager as? BLEManager
+    }
+
+    /// The active transport, for the manufacturer-data entry point (`OBDService+OEM.swift`).
+    var manufacturerDataTransport: CommProtocol {
+        elm327.commManager
     }
 
     private func bindCompatibilityReporting() {
@@ -951,11 +1187,158 @@ public struct VINInfo: Codable, Hashable {
 }
 
 extension OBDServiceError {
+    /// The transport rejected the response prompt because its frames could not be attributed.
+    public var isAmbiguousResponse: Bool {
+        guard case let .commandFailed(_, error) = self else { return false }
+        return (error as? OBDStreamError) == .ambiguousResponse
+    }
+
     /// A raw command whose answer didn't arrive before the response timeout. The adapter may
     /// still be receiving it, so a caller should let it finish before the next command.
     public var isResponseTimeout: Bool {
         guard case let .commandFailed(_, error) = self else { return false }
+        // Not sent at all, and no late answer of its own to wait for.
+        if isReconnectRequired { return false }
         if case CommunicationError.timeout = error { return true }
         return BLEManager.commandCompatibilityFailure(for: error) == .adapterResponseTimedOut
+    }
+
+    /// A raw command that wasn't sent because the adapter's stream can't be proven in sync on
+    /// this connection any more (see `OBDService.isAdapterReconnectRequired`). Not a timeout:
+    /// retrying won't help, reconnecting will.
+    public var isReconnectRequired: Bool {
+        switch self {
+        case let .commandFailed(_, error), let .clearFailed(error):
+            return (error as? OBDStreamError) == .reconnectRequired
+        default:
+            return false
+        }
+    }
+}
+
+/// Thrown, with nothing sent, when a request bound to one vehicle link finds another link (or none) current.
+public enum OBDVehicleLinkError: Error, Equatable { case linkChanged }
+
+/// The adapter connection a transport is on right now.
+///
+/// `epoch` is the identity: a counter the transport owns, guards with the same lock as the
+/// connection it describes, and advances every time that connection is established **or** torn
+/// down. Two snapshots with the same epoch describe the same physical connection, and a
+/// connection that went away can never compare equal to anything read afterwards. Bluetooth
+/// reads it together with the peripheral (`BLEPeripheralManager.connectionIdentity`); WiFi
+/// advances it with its socket. Nil for transports with nothing to lose (the demo transport).
+///
+/// `attempt` (Bluetooth's connection attempt) rides along for the compatibility report and makes
+/// equality stricter; it lives under another lock and is not what makes the snapshot sound.
+struct OBDAdapterConnectionSnapshot: Equatable, Sendable {
+    var attempt: UInt64?
+    var peripheralID: UUID?
+    var epoch: UInt64?
+
+    init(attempt: UInt64?, peripheralID: UUID?, epoch: UInt64? = nil) {
+        self.attempt = attempt
+        self.peripheralID = peripheralID
+        self.epoch = epoch
+    }
+
+    static let none = OBDAdapterConnectionSnapshot(attempt: nil, peripheralID: nil)
+}
+
+/// `OBDService.vehicleLink` with the ELM327 and adapter connection it was published on. Lock
+/// protected: written on the main actor, checked by a transport with its command mutex held.
+///
+/// Two rules keep it sound:
+///
+/// - **Reading never changes it.** The entry is read first, then the transport's connection,
+///   and the two are compared. Nothing is cleared from a read, so a link published between the
+///   two reads can't be erased by a comparison with the connection it replaced. An expired
+///   entry simply keeps reading as "no link" until the next publish or clear.
+/// - **The lock is a leaf**, except for `whileCurrent`. It is never held while reading the
+///   transport's connection: a Bluetooth teardown holds the transport's locks while it waits
+///   for the write queue, and the write queue takes this lock to hand over a bound command.
+final class OBDVehicleLinkRecord: @unchecked Sendable {
+    private struct Entry {
+        let link: OBDVehicleLink
+        let adapter: ObjectIdentifier
+        let connection: OBDAdapterConnectionSnapshot
+    }
+
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    /// The published link, or nil once `adapter`'s transport is no longer on the connection it
+    /// was published on. Never changes the record.
+    func currentLink(adapter: ELM327) -> OBDVehicleLink? {
+        // The entry first: whatever connection is read after it is at least as new, so a
+        // mismatch means the entry expired, never that a newer entry is being judged by an
+        // older connection.
+        guard let current = lock.withLock({ entry }) else { return nil }
+        guard current.adapter == ObjectIdentifier(adapter),
+              current.connection == adapter.commManager.adapterConnection else { return nil }
+        return current.link
+    }
+
+    func publish(_ link: OBDVehicleLink, adapter: ELM327, connection: OBDAdapterConnectionSnapshot) {
+        lock.withLock { entry = Entry(link: link, adapter: ObjectIdentifier(adapter), connection: connection) }
+    }
+
+    func clear() {
+        lock.withLock { entry = nil }
+    }
+
+    /// Whether `link` is the current link and `adapter`'s transport is still on the connection
+    /// it was published on. A snapshot: the entry is read first, then the connection (see the
+    /// type's comment). It can be stale the moment it returns; `whileCurrent` is what a write
+    /// relies on.
+    func isCurrent(_ link: OBDVehicleLink, adapter: ELM327) -> Bool {
+        guard let current = lock.withLock({ entry }) else { return false }
+        return current.link == link
+            && current.adapter == ObjectIdentifier(adapter)
+            && current.connection == adapter.commManager.adapterConnection
+    }
+
+    /// Runs `submit` while holding the record's lock, only if `link` is still the published
+    /// link for `adapter`. `publish` and `clear` take the same lock, so each of them either
+    /// comes first (and `submit` never runs: `linkChanged`) or returns only after `submit` did.
+    ///
+    /// `submit` must be short and must not wait or read the transport's connection: it is the
+    /// hand-off of a command's first bytes to the system. The transport's own connection is
+    /// serialized with that hand-off by the transport (the Bluetooth write session, the WiFi
+    /// socket lock), not here.
+    func whileCurrent(_ link: OBDVehicleLink, adapter: ELM327, _ submit: () throws -> Void) throws {
+        try lock.withLock {
+            guard let entry, entry.link == link, entry.adapter == ObjectIdentifier(adapter) else {
+                throw OBDVehicleLinkError.linkChanged
+            }
+            try submit()
+        }
+    }
+
+    /// The authorization a transport is handed for a request bound to `link`.
+    func authorization(for link: OBDVehicleLink, adapter: ELM327) -> OBDWriteAuthorization {
+        OBDWriteAuthorization(
+            check: { [self] in
+                guard isCurrent(link, adapter: adapter) else { throw OBDVehicleLinkError.linkChanged }
+            },
+            whileAuthorized: { [self] submit in
+                try whileCurrent(link, adapter: adapter, submit)
+            }
+        )
+    }
+}
+
+/// One vehicle link and what was learned while setting it up. See `OBDService.vehicleLink`.
+public struct OBDVehicleLink: Equatable, Sendable {
+    /// Minted by the setup that brought this link up. Two links never share one.
+    public let id: UUID
+    /// The VIN read during this link's setup, nil when the car didn't report one.
+    public let vin: String?
+    /// The Bluetooth peripheral this link runs on, nil for other transports.
+    public let adapterID: UUID?
+
+    public init(id: UUID, vin: String?, adapterID: UUID?) {
+        self.id = id
+        self.vin = vin
+        self.adapterID = adapterID
     }
 }

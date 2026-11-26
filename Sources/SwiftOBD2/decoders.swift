@@ -201,6 +201,8 @@ private var uasIDS: [UInt8: UAS] = {
     0x25: UAS(signed: false, scale: 1, unit: UnitLength.kilometers),
 
     0x27: UAS(signed: false, scale: 0.01, unit: Unit.gramsPerSecond),
+    // Minutes (Mode 01 PIDs 4D and 4E: time run with the MIL on, time since codes cleared).
+    0x34: UAS(signed: false, scale: 1, unit: UnitDuration.minutes),
 
     // Signed
     0x81: UAS(signed: true, scale: 1.0, unit: Unit.count),
@@ -414,8 +416,9 @@ struct MonitorDecoder: Decoder {
 
 struct FuelRateDecoder: Decoder {
     func decode(data: Data, unit: MeasurementUnit) -> Result<DecodeResult, DecodeError> {
+        // J1979 PID 5E: (256A + B) / 20 litres per hour — a flow, not a consumption per distance.
         let value = Double(bytesToInt(data)) * 0.05
-        return .success((.measurementResult(MeasurementResult(value: value, unit: UnitFuelEfficiency.litersPer100Kilometers))))
+        return .success((.measurementResult(MeasurementResult(value: value, unit: Unit(symbol: "L/h")))))
     }
 }
 
@@ -445,8 +448,10 @@ struct InjectTimingDecoder: Decoder {
 
 struct EvapPressureAltDecoder: Decoder {
     func decode(data: Data, unit: MeasurementUnit) -> Result<DecodeResult, DecodeError> {
-        let value = Double(bytesToInt(data)) - 32767
-        return .success((.measurementResult(MeasurementResult(value: value, unit: Unit.Pascal))))
+        guard data.count == 2 else { return .failure(.invalidData) }
+        let word = UInt16(bytesToInt(data))
+        let value = Double(Int16(bitPattern: word))
+        return .success(.measurementResult(MeasurementResult(value: value, unit: Unit.Pascal)))
     }
 }
 
@@ -479,15 +484,18 @@ struct MaxMafDecoder: Decoder {
         guard data.count > 0 else {
             return .failure(.invalidData)
         }
-        let value = data[0] * 10
-        return .success((.measurementResult(MeasurementResult(value: Double(value), unit: Unit.gramsPerSecond))))
+        // J1979 PID 50 byte A: the maximum in 10 g/s steps (B–D reserved). Scaled as a Double:
+        // `UInt8 * 10` trapped on overflow for any A above 25.
+        let value = Double(data[data.startIndex]) * 10
+        return .success((.measurementResult(MeasurementResult(value: value, unit: Unit.gramsPerSecond))))
     }
 }
 
 struct AbsoluteLoadDecoder: Decoder {
     func decode(data: Data, unit: MeasurementUnit) -> Result<DecodeResult, DecodeError> {
-        let value = (bytesToInt(data) * 100) / 255
-        return .success((.measurementResult(MeasurementResult(value: Double(value), unit: Unit.percent))))
+        // J1979 PID 43: (256A + B) × 100 / 255 %, kept fractional (integer division truncated it).
+        let value = Double(bytesToInt(data)) * 100 / 255
+        return .success((.measurementResult(MeasurementResult(value: value, unit: Unit.percent))))
     }
 }
 
@@ -498,11 +506,12 @@ struct EvapPressureDecoder: Decoder {
             return .failure(.invalidData)
         }
         
-        let a = twosComp(Int(data[0]), length: 8)
-        let b = twosComp(Int(data[1]), length: 8)
-
-        let value = ((Double(a) * 256.0) + Double(b)) / 4.0
-        return .success((.measurementResult(MeasurementResult(value: value, unit: UnitPressure.kilopascals))))
+        // J1979 PID 32: (256A + B) as a signed two's-complement word, 0.25 Pa per bit
+        // (−8192 … 8191.75 Pa). It was read unsigned and labelled kPa.
+        let a = data[data.startIndex]
+        let b = data[data.startIndex + 1]
+        let value = Double(Int16(bitPattern: UInt16(a) << 8 | UInt16(b))) / 4.0
+        return .success((.measurementResult(MeasurementResult(value: value, unit: Unit.Pascal))))
     }
 }
 
@@ -529,50 +538,33 @@ struct SensorVoltageDecoder: Decoder {
 
 struct O2SensorsDecoder: Decoder {
     func decode(data: Data, unit: MeasurementUnit) -> Result<DecodeResult, DecodeError> {
-        let bits = BitArray(data: data)
-        //        return (
-        //                (),  # bank 0 is invalid
-        //                tuple(bits[:2]),  # bank 1
-        //                tuple(bits[2:4]),  # bank 2
-        //                tuple(bits[4:6]),  # bank 3
-        //                tuple(bits[6:]),  # bank 4
-        //            )
-
-        let bank1 = Array(bits.binaryArray[0 ..< 4])
-        let bank2 = Array(bits.binaryArray[4 ..< 8])
-
-        return .success(.stringResult("\(bank1), \(bank2)"))
+        decodeO2Presence(data, sensorsPerBank: 4)
     }
 }
 
 struct O2SensorsAltDecoder: Decoder {
     func decode(data: Data, unit: MeasurementUnit) -> Result<DecodeResult, DecodeError> {
-        let bits = BitArray(data: data)
-        //        return (
-        //                (),  # bank 0 is invalid
-        //                tuple(bits[:2]),  # bank 1
-        //                tuple(bits[2:4]),  # bank 2
-        //                tuple(bits[4:6]),  # bank 3
-        //                tuple(bits[6:]),  # bank 4
-        //            )
-
-        let bank1 = Array(bits.binaryArray[0 ..< 2])
-        let bank2 = Array(bits.binaryArray[2 ..< 4])
-        let bank3 = Array(bits.binaryArray[4 ..< 6])
-        let bank4 = Array(bits.binaryArray[6 ..< 8])
-
-        return .success(.stringResult("\(bank1), \(bank2), \(bank3), \(bank4)"))
+        decodeO2Presence(data, sensorsPerBank: 2)
     }
 }
 
+private func decodeO2Presence(_ data: Data, sensorsPerBank: Int) -> Result<DecodeResult, DecodeError> {
+    guard let bitmap = data.first else { return .failure(.invalidData) }
+    // SAE assigns bit 0 to bank 1 sensor 1, advancing by sensor and then by bank.
+    let banks = stride(from: 0, to: 8, by: sensorsPerBank).map { start in
+        let sensors = (start ..< start + sensorsPerBank).map { (bitmap >> $0) & 1 }
+        return String(describing: sensors)
+    }
+    return .success(.stringResult(banks.joined(separator: ", ")))
+}
 
 struct OBDComplianceDecoder: Decoder {
     func decode(data: Data, unit: MeasurementUnit) -> Result<DecodeResult, DecodeError> {
-        guard data.count > 1 else {
+        // J1979 PID 1C is one byte: the conformance index is byte A (it read a byte B that a
+        // one-byte reply doesn't have).
+        guard let i = data.first else {
             return .failure(.invalidData)
         }
-        
-        let i = data[1]
 
         if i < OBD_COMPLIANCE.count {
             return .success(.stringResult((OBD_COMPLIANCE[Int(i)])))

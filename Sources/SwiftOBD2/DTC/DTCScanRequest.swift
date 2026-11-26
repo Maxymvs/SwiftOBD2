@@ -399,6 +399,8 @@ extension ELM327 {
             let lines: [String]
             do {
                 lines = try await sendDTCRequest(service)
+            } catch OBDStreamError.ambiguousResponse {
+                return .invalidResponse
             } catch {
                 switch DTCTransportDisposition(error: error, linkIsUp: connectionState.isConnected) {
                 case .cancelled:

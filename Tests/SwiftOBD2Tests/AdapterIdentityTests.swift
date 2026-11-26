@@ -178,9 +178,9 @@ final class AdapterIdentityTests: XCTestCase {
     }
 
     func testLegacyOBDInfoStillDecodes() throws {
-        let legacy = #"{"vin":"3VV3B7AX5LM000000","obdProtocol":"6"}"#
+        let legacy = #"{"vin":"3VV3B7AX2LM000001","obdProtocol":"6"}"#
         let info = try JSONDecoder().decode(OBDInfo.self, from: Data(legacy.utf8))
-        XCTAssertEqual(info.vin, "3VV3B7AX5LM000000")
+        XCTAssertEqual(info.vin, "3VV3B7AX2LM000001")
         XCTAssertNil(info.responderHeaders)
     }
 }

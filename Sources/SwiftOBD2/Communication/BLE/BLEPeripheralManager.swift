@@ -132,6 +132,13 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         )
     }
 
+    /// The peripheral this manager is on and the epoch of that connection, read together under
+    /// the lock that guards both. The epoch advances whenever the peripheral is prepared or the
+    /// manager is reset, so it names one physical connection and nothing after it.
+    var connectionIdentity: (peripheralID: UUID?, epoch: UInt64) {
+        stateLock.withLock { (connectedPeripheral?.identifier, UInt64(connectionGeneration)) }
+    }
+
     func resolutionSnapshot() -> (
         binding: BLEAdapterBinding,
         fingerprint: BLEGATTFingerprint,

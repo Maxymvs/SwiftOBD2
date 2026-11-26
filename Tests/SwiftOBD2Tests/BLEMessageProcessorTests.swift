@@ -21,7 +21,7 @@ final class BLEMessageProcessorTests: XCTestCase {
     func testResponseArrivingBetweenWindowsIsRetainedForTheNextArm() async throws {
         let processor = BLEMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(buffer("7E8 03 7F 03 78"))
         let interim = try await processor.awaitResponse(for: first, timeout: 1)
         XCTAssertEqual(interim, ["7E8 03 7F 03 78"])
@@ -29,7 +29,7 @@ final class BLEMessageProcessorTests: XCTestCase {
         // No slot is armed at this instant — this is the gap.
         processor.processReceivedData(buffer("7E8 04 43 01 01 04"))
 
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         let late = try await processor.awaitResponse(for: continuation, timeout: 1)
         XCTAssertEqual(late, ["7E8 04 43 01 01 04"])
     }
@@ -38,60 +38,54 @@ final class BLEMessageProcessorTests: XCTestCase {
     func testPartialResponseSpanningTheGapCompletesInTheContinuation() async throws {
         let processor = BLEMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(buffer("7E8 03 7F 03 78"))
         _ = try await processor.awaitResponse(for: first, timeout: 1)
 
         processor.processReceivedData(Data("7E8 04 43 01".utf8)) // no prompt yet
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         processor.processReceivedData(Data(" 01 04\r\r>".utf8))
 
         let late = try await processor.awaitResponse(for: continuation, timeout: 1)
         XCTAssertEqual(late, ["7E8 04 43 01 01 04"])
     }
 
-    /// Retention must never become leakage: a *new* request clears whatever was left over, so an
-    /// unrelated command can never be answered with the previous exchange's bytes.
-    func testANewRequestDiscardsRetainedBytes() async throws {
+    /// Retention must never become leakage: a *new* command refuses to arm while bytes nobody
+    /// asked for are waiting, so it can never be answered with the previous exchange's bytes.
+    /// (It used to clear them and arm, which dropped the start of a reply still arriving.)
+    func testANewRequestRefusesToArmOverRetainedBytes() async throws {
         let processor = BLEMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(buffer("7E8 03 7F 03 78"))
         _ = try await processor.awaitResponse(for: first, timeout: 1)
         processor.processReceivedData(buffer("7E8 04 43 01 01 04")) // unclaimed, retained
 
-        let next = processor.beginRequest()
-        processor.processReceivedData(buffer("7E8 06 41 00 BE 3F A8 13"))
-        let lines = try await processor.awaitResponse(for: next, timeout: 1)
-
-        XCTAssertEqual(lines, ["7E8 06 41 00 BE 3F A8 13"], "No stale line may ride along")
+        XCTAssertThrowsError(try processor.beginRequest()) { error in
+            XCTAssertEqual(error as? OBDStreamError, .unsynchronized)
+        }
+        XCTAssertTrue(processor.isStreamDirty, "only a proven resynchronization lets the next command out")
     }
 
     /// Retention is bounded: an unclaimed response bigger than the buffer cap is dropped rather
-    /// than growing without limit.
-    func testUnclaimedRetentionIsBounded() async {
+    /// than growing without limit, and the stream counts as dirty.
+    func testUnclaimedRetentionIsBounded() async throws {
         let processor = BLEMessageProcessor()
 
         let line = "7E8 02 43 00\r"
         let oversized = String(repeating: line, count: BLEConstants.maxBufferSize / line.utf8.count + 10)
         processor.processReceivedData(Data((oversized + "\r>").utf8))
 
-        let token = processor.beginContinuationRequest()
-        do {
-            let lines = try await processor.awaitResponse(for: token, timeout: 0.3)
-            XCTFail("Oversized unclaimed data must be cleared, got \(lines.count) lines")
-        } catch {
-            XCTAssertTrue(
-                error as? BLEMessageProcessorError == .responseTimeout,
-                "Unexpected error: \(error)"
-            )
+        XCTAssertTrue(processor.isStreamDirty)
+        XCTAssertThrowsError(try processor.beginContinuationRequest()) { error in
+            XCTAssertEqual(error as? OBDStreamError, .unsynchronized, "nothing oversized is left to hand out")
         }
     }
 
     /// `NO DATA` still reaches the caller as the distinct silence signal the DTC layer needs.
-    func testNoDataIsDeliveredAsItsOwnError() async {
+    func testNoDataIsDeliveredAsItsOwnError() async throws {
         let processor = BLEMessageProcessor()
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
         processor.processReceivedData(Data("NO DATA\r\r>".utf8))
 
         do {
