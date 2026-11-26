@@ -55,6 +55,16 @@ final class SupportedPIDBitmapTests: XCTestCase {
         XCTAssertEqual(pids, expected, "got \(describe(pids)), expected \(describe(expected))")
     }
 
+    func testUnionsValidMatchingBitmapsFromMultipleECUs() async {
+        let pids = await supported(["0120": [
+            "7E806412080000000", // PID 21
+            "7E906412000020000", // PID 2F
+            "7EA054120FFFFFF",   // Too short
+            "7EB064140FFFFFFFF", // Another range
+        ]])
+        XCTAssertEqual(pids, Self.mode01([0x21, 0x2F]))
+    }
+
     func testTheSameRangesOn29BitCAN() async {
         let pids = await supported([
             "0100": ["18DAF110064100BE3FA813"],

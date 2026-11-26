@@ -512,6 +512,19 @@ final class OEMBatchExecutorTests: XCTestCase {
         XCTAssertEqual(calls, 4)
     }
 
+    func testAdmissionCanReadMainActorStateSynchronously() async throws {
+        let channel = ScriptedOEMChannel()
+        let script = OEMAdmissionScript([true, false])
+        let admission: OEMBatchAdmission = {
+            // A synchronous call on its declared actor cannot suspend to issue a command.
+            MainActor.assertIsolated()
+            return script.next()
+        }
+        let result = await run(try OEMTestCatalog.batch("test-vw", ["E.028D"]), channel, admission: admission)
+        XCTAssertEqual(result.failure, .admissionRevoked)
+        XCTAssertEqual(channel.commands, ["ATSH 7E0"] + Self.functionalRestore)
+    }
+
     // MARK: Configuration failures
 
     func testQuestionMarkOnSetupIsConfigurationRejected() async throws {
@@ -629,6 +642,20 @@ final class OEMBatchExecutorTests: XCTestCase {
             XCTAssertEqual(result.adapterState, .unresolved)
             XCTAssertTrue(channel.markedUnresolved)
         }
+    }
+
+    /// A caller with no admission check still gets a link check before every read.
+    func testLinkReplacedBetweenReadsStopsBeforeTheNextRead() async throws {
+        let channel = ScriptedOEMChannel()
+        channel.reads["22028D"] = .lines(["7E80562028D0CE2"])
+        let executor = OEMBatchExecutor(batch: try OEMTestCatalog.batch("test-vw", ["E.028D", "E.1002"]), clock: channel.clock)
+        let result = await Task {
+            await executor.run(on: channel, isLinkCurrent: { !channel.commands.contains("22028D") })
+        }.value
+        XCTAssertNotNil(number(result.reads[0].outcome, "ECU_T"))
+        XCTAssertEqual(outcomes(result).last, .notAttempted(.linkLost))
+        XCTAssertFalse(channel.commands.contains("221002"), "no read after the link was replaced")
+        XCTAssertEqual(result.failure, .linkLost)
     }
 
     func testLinkLossDuringRestoreIsUnresolved() async throws {

@@ -525,11 +525,12 @@ func runOEMBatch(
 }
 
 /// Scripted admission answers, in order; the last one repeats. Counts every question.
-actor OEMAdmissionScript {
+@MainActor
+final class OEMAdmissionScript {
     private var answers: [Bool]
     private(set) var calls = 0
 
-    init(_ answers: [Bool]) {
+    nonisolated init(_ answers: [Bool]) {
         self.answers = answers
     }
 
@@ -539,7 +540,7 @@ actor OEMAdmissionScript {
     }
 
     nonisolated var admission: OEMBatchAdmission {
-        { await self.next() }
+        { self.next() }
     }
 }
 

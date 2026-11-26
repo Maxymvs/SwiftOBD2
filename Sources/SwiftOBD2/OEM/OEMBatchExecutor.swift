@@ -67,8 +67,9 @@ struct OEMSystemClock: OEMClock {
 
 /// Asked after the adapter is acquired and again before every read. `false` stops the batch:
 /// the caller no longer owns this work (its request ended, the link or the car changed, the
-/// module stopped being served).
-public typealias OEMBatchAdmission = @Sendable () async -> Bool
+/// module stopped being served). Read caller-maintained state synchronously; the adapter
+/// command channel is held during this check.
+public typealias OEMBatchAdmission = @MainActor @Sendable () -> Bool
 
 struct OEMBatchExecutor {
     /// A read is only started when at least this much of the budget is left.
@@ -110,7 +111,8 @@ struct OEMBatchExecutor {
     func run(
         on channel: OEMCommandChannel,
         deadline: TimeInterval? = nil,
-        admission: OEMBatchAdmission? = nil
+        admission: OEMBatchAdmission? = nil,
+        isLinkCurrent: () -> Bool = { true }
     ) async -> OEMBatchResult {
         let start = clock.now()
         let deadline = deadline ?? (start + batch.budget)
@@ -132,7 +134,7 @@ struct OEMBatchExecutor {
         }
         func admitted() async -> Bool {
             guard let admission else { return true }
-            return await admission()
+            return await MainActor.run(body: admission)
         }
 
         // The first check that runs with the adapter held: whatever changed while this batch
@@ -141,6 +143,8 @@ struct OEMBatchExecutor {
             stop(.cancelled, skipping: .cancelled)
         } else if !(await admitted()) {
             stop(.admissionRevoked, skipping: .admissionRevoked)
+        } else if !isLinkCurrent() {
+            stop(.linkLost, skipping: .linkLost)
         }
 
         // The stream this batch inherits may be dirty: the ordinary command just before it may
@@ -163,6 +167,10 @@ struct OEMBatchExecutor {
             for command in OEMAdapterCommand.setup(for: target) {
                 if Task.isCancelled {
                     stop(.cancelled, skipping: .cancelled)
+                    break
+                }
+                guard isLinkCurrent() else {
+                    stop(.linkLost, skipping: .linkLost)
                     break
                 }
                 let now = clock.now()
@@ -199,6 +207,10 @@ struct OEMBatchExecutor {
             reads: for (index, command) in batch.commands.enumerated() {
                 if Task.isCancelled {
                     stop(.cancelled, skipping: .cancelled)
+                    break
+                }
+                guard isLinkCurrent() else {
+                    stop(.linkLost, skipping: .linkLost)
                     break
                 }
                 guard await admitted() else {

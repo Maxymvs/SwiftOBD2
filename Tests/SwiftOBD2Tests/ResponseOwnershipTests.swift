@@ -73,6 +73,14 @@ final class ResponseOwnershipTests: XCTestCase {
         XCTAssertEqual(speed(results), 31)
     }
 
+    func testReorderedMode01ReplyKeepsEveryEchoedPID() throws {
+        let results = try OBDService.decodePIDResponse(
+            ["7E806410D280C1F40"], commands: [.mode1(.rpm), .mode1(.speed)], parser: can11, unit: .metric
+        )
+        XCTAssertEqual(rpm(results), 2000)
+        XCTAssertEqual(speed(results), 40)
+    }
+
     /// An ECU leaves unsupported PIDs out of a multi-PID answer: only the echoed one decodes.
     func testBatchedReplyDecodesOnlyEchoedPIDs() throws {
         let results = try OBDService.decodePIDResponse(
@@ -100,6 +108,63 @@ final class ResponseOwnershipTests: XCTestCase {
         XCTAssertEqual(readings[speed]?.value, 62)
         XCTAssertEqual(try XCTUnwrap(readings[fuel]?.value), 100 * 128 / 255, accuracy: 0.001)
         XCTAssertEqual(Array(comm.sentCommands.suffix(2)), ["010D2F", "0106"])
+    }
+
+    func testSplitPollKeepsSpeedWhenAnotherGroupExplicitlyHasNoData() async throws {
+        for noData: Error in [BLEManagerError.noData, CommunicationError.noData] {
+            let comm = OwnershipScriptedComm(
+                responses: ["0100": ["7E8064100BE3FA813"], "010D": ["7E803410D28"]],
+                fallback: MOCKComm(), failures: ["0108": noData]
+            )
+            let service = OBDService(comm: comm, connectionType: .demo)
+            _ = try await service.startConnection(preferedProtocol: .protocol6)
+
+            let trim = OBDCommand.mode1(.shortFuelTrim2)
+            let readings = try await service.requestPIDs([.mode1(.speed), trim], unit: .metric, retries: 1)
+            XCTAssertEqual(speed(readings), 40)
+            XCTAssertNil(readings[trim])
+            XCTAssertEqual(Array(comm.sentCommands.suffix(2)), ["010D", "0108"])
+        }
+    }
+
+    /// With every group saying NO DATA (ignition off), the split poll fails the way a
+    /// single-group poll does instead of returning an empty success.
+    func testSplitPollThrowsWhenEveryGroupHasNoData() async throws {
+        let comm = OwnershipScriptedComm(
+            responses: ["0100": ["7E8064100BE3FA813"]],
+            fallback: MOCKComm(), failures: ["0106": CommunicationError.noData, "0108": CommunicationError.noData]
+        )
+        let service = OBDService(comm: comm, connectionType: .demo)
+        _ = try await service.startConnection(preferedProtocol: .protocol6)
+        do {
+            _ = try await service.requestPIDs([.mode1(.shortFuelTrim1), .mode1(.shortFuelTrim2)], unit: .metric, retries: 1)
+            XCTFail("Expected NO DATA to reach the poller")
+        } catch OBDServiceError.commandFailed(_, let underlying) {
+            guard case CommunicationError.noData = underlying else { return XCTFail("Expected noData, got \(underlying)") }
+        }
+    }
+
+    func testSplitPollStillThrowsForCancellationAndLinkLoss() async throws {
+        for failure: Error in [CancellationError(), CommunicationError.connectionLost] {
+            let comm = OwnershipScriptedComm(
+                responses: ["0100": ["7E8064100BE3FA813"], "010D": ["7E803410D28"]],
+                fallback: MOCKComm(), failures: ["0108": failure]
+            )
+            let service = OBDService(comm: comm, connectionType: .demo)
+            _ = try await service.startConnection(preferedProtocol: .protocol6)
+            do {
+                _ = try await service.requestPIDs([.mode1(.speed), .mode1(.shortFuelTrim2)], unit: .metric)
+                XCTFail("Expected the transport failure to reach the poller")
+            } catch OBDServiceError.commandFailed(let command, let underlying) {
+                XCTAssertEqual(command, "0108")
+                XCTAssertEqual(underlying is CancellationError, failure is CancellationError)
+                if failure is CommunicationError {
+                    guard case CommunicationError.connectionLost = underlying else {
+                        return XCTFail("Expected connectionLost")
+                    }
+                }
+            }
+        }
     }
 
     func test29BitOwnershipChecks() throws {
@@ -244,15 +309,18 @@ final class OwnershipScriptedComm: CommProtocol {
 
     private let responses: [String: [String]]
     private let fallback: CommProtocol?
+    private let failures: [String: Error]
     private(set) var sentCommands: [String] = []
 
-    init(responses: [String: [String]], fallback: CommProtocol? = nil) {
+    init(responses: [String: [String]], fallback: CommProtocol? = nil, failures: [String: Error] = [:]) {
         self.responses = responses
         self.fallback = fallback
+        self.failures = failures
     }
 
     func sendCommand(_ command: String, retries: Int) async throws -> [String] {
         sentCommands.append(command)
+        if let failure = failures[command] { throw failure }
         if let response = responses[command] { return response }
         return try await fallback?.sendCommand(command, retries: retries) ?? ["NO DATA"]
     }

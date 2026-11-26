@@ -547,13 +547,13 @@ class WifiManager: CommProtocol {
     func connectionStateDidChange(_ newState: NWConnection.State, socket: WifiSocket) -> Result<Void, Error>? {
         switch newState {
         case .ready:
-            let installed = socketLock.withLock {
-                guard pendingSocket === socket else { return false }
+            let installation = socketLock.withLock { () -> (displaced: WifiSocket?, installed: Bool) in
+                guard pendingSocket === socket else { return (nil, false) }
                 pendingSocket = nil
-                installLocked(socket, publishing: .connectedToAdapter)
-                return true
+                return (installLocked(socket, publishing: .connectedToAdapter), true)
             }
-            guard installed else { return .failure(CommunicationError.connectionLost) }
+            guard installation.installed else { return .failure(CommunicationError.connectionLost) }
+            installation.displaced?.cancel()
             logger.info("WiFi adapter connection ready")
             armReceive(on: socket)
             return .success(())
@@ -581,22 +581,24 @@ class WifiManager: CommProtocol {
 
     /// Takes ownership of a socket and starts the single, long-lived receive loop over it.
     func attach(socket: WifiSocket) {
-        let superseded = socketLock.withLock {
-            let superseded = pendingSocket
+        let (pending, displaced) = socketLock.withLock {
+            let pending = pendingSocket
             pendingSocket = nil
-            installLocked(socket, publishing: nil)
-            return superseded
+            return (pending, installLocked(socket, publishing: nil))
         }
-        if superseded !== socket { superseded?.cancel() }
+        if pending !== socket, pending !== displaced { pending?.cancel() }
+        displaced?.cancel()
         armReceive(on: socket)
     }
 
     /// Must be called under `socketLock`, after claiming the current attempt.
-    private func installLocked(_ socket: WifiSocket, publishing state: ConnectionState?) {
+    private func installLocked(_ socket: WifiSocket, publishing state: ConnectionState?) -> WifiSocket? {
+        let displaced = currentSocket
         messageProcessor.reset()
-        if currentSocket !== socket { socketEpoch &+= 1 }
+        if displaced !== socket { socketEpoch &+= 1 }
         currentSocket = socket
         if let state, connectionState != state { connectionState = state }
+        return displaced === socket ? nil : displaced
     }
 
     /// Arms exactly one read; the completion hands the bytes to the processor and re-arms.

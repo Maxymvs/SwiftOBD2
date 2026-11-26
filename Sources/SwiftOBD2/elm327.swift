@@ -589,13 +589,7 @@ extension ELM327 {
             do {
                 logger.info("Getting supported PIDs for \(pidGetter.properties.command)")
                 let response = try await sendCommand(pidGetter.properties.command)
-                // find first instance of 41 plus command sent, from there we determine the position of everything else
-                // Ex.
-                //        || ||
-                // 7E8 06 41 00 BE 7F B8 13
-                guard let supportedPidsByECU = parseResponse(response, to: pidGetter.properties.command) else {
-                    continue
-                }
+                let supportedPidsByECU = parseResponse(response, to: pidGetter.properties.command)
 
                 // A bitmap marks commands of its own service only (`0100` → `01xx`, `0900` →
                 // `09xx`): matching on the PID alone let a Mode 01 bit mark `0902` or `0601`.
@@ -622,16 +616,19 @@ extension ELM327 {
     /// The bitmap covers the 32 PIDs after the request's own PID (its base): `0100` → 01–20,
     /// `0120` → 21–40, `0640` → 41–60. It is exactly the four bytes after the echoed PID; a reply
     /// declaring fewer is no bitmap, and nothing after the four is read.
-    private func parseResponse(_ response: [String], to command: String) -> Set<String>? {
-        guard let base = OBDResponseOwnership.request(command)?.pid,
-              let ecuData = try? canProtocol?.parse(response)
-              .first(where: { OBDResponseOwnership.isPositiveResponse($0, to: command) })?.data,
-              ecuData.count >= 5
-        else {
-            return nil
+    private func parseResponse(_ response: [String], to command: String) -> Set<String> {
+        guard let base = OBDResponseOwnership.request(command)?.pid, let parser = canProtocol else { return [] }
+        var supported: Set<String> = []
+        // Each bitmap fits in one frame. Parse independently so a malformed frame or
+        // multiple responders classified as .unknown cannot hide the valid answers.
+        for line in response {
+            guard let message = try? parser.parse([line]).first,
+                  OBDResponseOwnership.isPositiveResponse(message, to: command),
+                  let data = message.data, data.count >= 5 else { continue }
+            let bits = BitArray(data: data.dropFirst().prefix(4)).binaryArray
+            supported.formUnion(extractSupportedPIDs(bits, base: base))
         }
-        let binaryData = BitArray(data: ecuData.dropFirst().prefix(4)).binaryArray
-        return extractSupportedPIDs(binaryData, base: base)
+        return supported
     }
 
     /// The PIDs (two hex digits) whose bits are set, bit `i` (0-based) being PID `base + i + 1`.
@@ -667,38 +664,39 @@ enum OBDReplyLogText {
 }
 
 struct BatchedResponse {
-    private var response: Data
-    private var unit: MeasurementUnit
+    private let response: Data
+    private let unit: MeasurementUnit
+
     init(response: Data, _ unit: MeasurementUnit) {
         self.response = response
         self.unit = unit
     }
 
-    mutating func extractValue(_ cmd: OBDCommand) -> MeasurementResult? {
-        let properties = cmd.properties
-        let size = properties.bytes
-        // A batched reply carries `<PID> <value bytes>` for each PID the ECU answered, in order;
-        // it leaves out PIDs it doesn't support. Decode only a PID that is echoed here, and don't
-        // consume bytes for one that isn't, so an omitted or misattributed PID never reads
-        // another PID's bytes.
-        guard size >= 1, let pid = OBDResponseOwnership.request(properties.command)?.pid,
-              response.first == pid, response.count >= size
-        else { return nil }
-        let valueData = response.prefix(size)
-
-        response.removeFirst(size)
-        //        print("Buffer: \(buffer.compactMap { String(format: "%02X ", $0) }.joined())")
-        let result = cmd.properties.decode(data: valueData, unit: unit)
-
-        
-
-        switch result {
-        case let .success(measurementResult):
-            return measurementResult.measurementResult
-        case let .failure(error):
-            obdError("Failed to decode command \(cmd.properties.command): \(error.localizedDescription) | Data: \(valueData.map { String(format: "%02X", $0) }.joined(separator: " "))", category: .parsing)
-            return nil
+    func decode(_ commands: [OBDCommand]) -> [OBDCommand: MeasurementResult] {
+        var requested: [UInt8: OBDCommand] = [:]
+        for command in commands {
+            guard let pid = OBDResponseOwnership.request(command.properties.command)?.pid else { continue }
+            requested[pid] = command
         }
+
+        var readings: [OBDCommand: MeasurementResult] = [:]
+        var remaining = response[...]
+        // The ECU may omit or reorder PIDs. Each echoed PID determines the width.
+        // Stop at an unexpected or truncated PID since the next boundary is unproven.
+        while let pid = remaining.first, let command = requested[pid] {
+            let size = command.properties.bytes
+            guard size > 0, remaining.count >= size else { break }
+            let valueData = remaining.prefix(size)
+            remaining = remaining.dropFirst(size)
+            guard readings[command] == nil else { continue }
+            switch command.properties.decode(data: valueData, unit: unit) {
+            case let .success(result):
+                readings[command] = result.measurementResult
+            case let .failure(error):
+                obdError("Failed to decode command \(command.properties.command): \(error.localizedDescription)", category: .parsing)
+            }
+        }
+        return readings
     }
 }
 

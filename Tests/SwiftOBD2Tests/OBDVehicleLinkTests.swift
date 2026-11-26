@@ -132,6 +132,55 @@ final class OBDVehicleLinkPublicationTests: XCTestCase {
     }
 
     /// A new link on the same adapter connection (reinitialization) still gets its own id.
+    func testOEMReadsNeverUseThePreviousProtocolDuringReconnectPublication() async throws {
+        let comm = OEMLinkScriptedComm()
+        comm.script(vin: vinA, peripheral: adapterA)
+        let service = OBDService(comm: comm, connectionType: .demo)
+        _ = try await service.startConnection(preferedProtocol: .protocol6)
+        let batch = try OEMTestCatalog.batch("test-vw", ["E.028D"])
+        comm.channel.reads["22028D"] = .lines(["7E80562028D0CE2"])
+        let supported = await service.readManufacturerData(batch)
+        XCTAssertNil(supported.failure)
+        XCTAssertTrue(comm.channel.commands.contains("ATSH 7E0"))
+        let sent = comm.channel.commands
+
+        comm.uses29BitCAN = true
+        comm.script(vin: vinB, peripheral: adapterB)
+        service.vehicleSetupWillPublish = { @MainActor in
+            await drainMainQueue()
+            XCTAssertEqual(service.connectionState, .connectedToVehicle)
+            XCTAssertEqual(service.latestOBDInfo?.obdProtocol, .protocol6)
+            let premature = await service.readManufacturerData(batch)
+            XCTAssertEqual(premature.failure, .notConnected)
+            XCTAssertEqual(comm.channel.commands, sent)
+        }
+        _ = try await service.startConnection(preferedProtocol: .protocol7)
+
+        let unsupported = await service.readManufacturerData(batch)
+        XCTAssertEqual(unsupported.failure, .unsupportedProtocol)
+        XCTAssertEqual(comm.channel.commands, sent)
+    }
+
+    func testOEMRechecksItsOriginalLinkAfterAcquiringTheChannel() async throws {
+        let comm = OEMLinkScriptedComm()
+        comm.script(vin: vinA, peripheral: adapterA)
+        let service = OBDService(comm: comm, connectionType: .demo)
+        _ = try await service.startConnection(preferedProtocol: .protocol6)
+        let hold = SetupHold()
+        comm.beforeChannel = { await hold.holdFirstCaller() }
+        let batch = try OEMTestCatalog.batch("test-vw", ["E.028D"])
+        let read = Task { await service.readManufacturerData(batch) }
+        try await hold.waitUntilHeld()
+
+        comm.script(vin: vinB, peripheral: adapterB)
+        _ = try await service.startConnection(preferedProtocol: .protocol6)
+        hold.release()
+
+        let result = await read.value
+        XCTAssertEqual(result.failure, .linkLost)
+        XCTAssertEqual(comm.channel.commands, [])
+    }
+
     func testReinitializationMintsANewLinkID() async throws {
         let comm = LinkScriptedComm()
         comm.script(vin: vinA, peripheral: adapterA)
@@ -450,7 +499,7 @@ final class SetupHold: @unchecked Sendable {
 /// physical peripheral. Every `connectAsync` is a new adapter connection (a new attempt) to the
 /// peripheral scripted at that moment, and records it as the reconnect target the way the BLE
 /// transport does.
-final class LinkScriptedComm: CommProtocol {
+class LinkScriptedComm: CommProtocol {
     @Published var connectionState: ConnectionState = .disconnected
     var connectionStatePublisher: Published<ConnectionState>.Publisher { $connectionState }
     var obdDelegate: OBDServiceDelegate?
@@ -527,6 +576,17 @@ final class LinkScriptedComm: CommProtocol {
         return try await mock.sendCommand(command, retries: retries)
     }
 
+    func sendCommand(_ command: String, retries: Int, authorization: OBDWriteAuthorization) async throws -> [String] {
+        try authorization.check()
+        return try await sendCommand(command, retries: retries)
+    }
+
+    func withExclusiveCommandChannel<T>(
+        deadline: TimeInterval, _ body: @escaping (OEMCommandChannel) async throws -> T
+    ) async throws -> T {
+        throw OEMTransportError.unsupportedTransport
+    }
+
     func disconnectPeripheral() {
         connectionState = .disconnected
     }
@@ -541,6 +601,25 @@ final class LinkScriptedComm: CommProtocol {
         let second = ["7E8", "21"] + bytes[6 ..< 13]
         let third = ["7E8", "22"] + bytes[13 ..< 20]
         return [first, second, third].map { $0.joined(separator: " ") }
+    }
+}
+
+private final class OEMLinkScriptedComm: LinkScriptedComm {
+    let channel = ScriptedOEMChannel()
+    var uses29BitCAN = false
+    var beforeChannel: (() async -> Void)?
+
+    override func sendCommand(_ command: String, retries: Int) async throws -> [String] {
+        if uses29BitCAN, command == "0100" { return ["18DAF110064100BE3FA813"] }
+        if uses29BitCAN, command == "0902" { return ["NO DATA"] }
+        return try await super.sendCommand(command, retries: retries)
+    }
+
+    override func withExclusiveCommandChannel<T>(
+        deadline: TimeInterval, _ body: @escaping (OEMCommandChannel) async throws -> T
+    ) async throws -> T {
+        await beforeChannel?()
+        return try await body(channel)
     }
 }
 

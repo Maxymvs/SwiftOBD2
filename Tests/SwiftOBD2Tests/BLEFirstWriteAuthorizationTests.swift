@@ -42,6 +42,33 @@ final class BLEFirstWriteAuthorizationTests: XCTestCase {
         try await rig.assertStreamAndSessionUntouched()
     }
 
+    @MainActor
+    func testStopConnectionRevokesAFlowControlledClearBeforeDisconnecting() async throws {
+        let rig = BoundClearRig(mode: .withoutResponse)
+        let comm = FlowControlledClearComm(rig: rig)
+        comm.script(vin: "TESTVIN0000000001", peripheral: UUID())
+        let service = OBDService(comm: comm, connectionType: .demo)
+        _ = try await service.startConnection(preferedProtocol: .protocol6)
+        let link = try XCTUnwrap(service.vehicleLink)
+        rig.transport.canSend = false
+        let blocked = rig.transport.expectFlowControlRefusal()
+        let clear = Task { try await service.clearTroubleCodes(on: link) }
+        await blocked.value
+        await rig.coordinator.drainEvents()
+
+        // Give the write capacity back inside disconnectPeripheral(), before the
+        // transport reports the dropped connection or invalidates the write session.
+        service.stopConnection()
+
+        do {
+            try await clear.value
+            XCTFail("The queued Mode 04 must be refused")
+        } catch let error as OBDVehicleLinkError {
+            XCTAssertEqual(error, .linkChanged)
+        }
+        XCTAssertTrue(rig.transport.commands.isEmpty)
+    }
+
     /// With response: there is no flow-control wait, so the revocation lands while the executor
     /// is busy before the first chunk (here, a slow MTU query). The gate sits at the first chunk.
     func testWithResponseALinkClearedBeforeTheFirstChunkWritesNothing() async throws {
@@ -611,6 +638,31 @@ private final class BoundClearRig: @unchecked Sendable {
         }
         XCTAssertEqual(lines, ["7E8064100BE3FA813"], file: file, line: line)
         XCTAssertEqual(transport.commands, ["0100"], "written directly on the same session, no probe", file: file, line: line)
+    }
+}
+
+private final class FlowControlledClearComm: LinkScriptedComm {
+    let rig: BoundClearRig
+
+    init(rig: BoundClearRig) { self.rig = rig }
+
+    override func sendCommand(_ command: String, retries: Int, authorization: OBDWriteAuthorization) async throws -> [String] {
+        try await rig.exchange.send(command, retries: retries, responseTimeout: 1) {
+            try self.rig.target(authorization: authorization)
+        }
+    }
+
+    override func disconnectPeripheral() {
+        advanceEpoch()
+        rig.transport.canSend = true
+        rig.coordinator.peripheralIsReady(session: rig.session)
+        let drained = DispatchSemaphore(value: 0)
+        Task.detached { [rig] in
+            await rig.coordinator.drainEvents()
+            drained.signal()
+        }
+        XCTAssertEqual(drained.wait(timeout: .now() + 2), .success)
+        super.disconnectPeripheral()
     }
 }
 

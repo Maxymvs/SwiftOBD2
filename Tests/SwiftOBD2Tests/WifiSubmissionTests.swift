@@ -478,6 +478,32 @@ final class WifiSubmissionTests: XCTestCase {
 
     // MARK: connectAsync's state handler
 
+    func testInstallingReplacementCancelsOnlyTheDisplacedSocket() {
+        for viaReady in [false, true] {
+            let manager = WifiManager()
+            let first = SubmissionTestSocket()
+            let replacement = SubmissionTestSocket()
+            manager.attach(socket: first)
+            first.onCancel = {
+                // An adapter callback can re-enter the manager from cancel().
+                _ = manager.connectionStateDidChange(.cancelled, socket: first)
+                XCTAssertTrue(manager.socket === replacement)
+            }
+
+            if viaReady {
+                manager.beginConnectionAttempt(socket: replacement)
+                _ = manager.connectionStateDidChange(.ready, socket: replacement)
+            } else {
+                manager.attach(socket: replacement)
+            }
+
+            XCTAssertEqual(first.cancelCount, 1)
+            XCTAssertEqual(replacement.cancelCount, 0)
+            XCTAssertTrue(manager.socket === replacement)
+            first.onCancel = nil
+        }
+    }
+
     func testAnOldConnectionsCancellationChangesNothing() async throws {
         let socketA = SubmissionTestSocket()
         let socketB = SubmissionTestSocket()

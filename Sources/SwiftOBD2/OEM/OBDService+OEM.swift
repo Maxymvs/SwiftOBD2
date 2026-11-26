@@ -63,8 +63,9 @@ extension OBDService {
             )
         }
 
-        guard connectionState == .connectedToVehicle else { return notStarted(.notConnected) }
-        switch latestOBDInfo?.obdProtocol {
+        guard connectionState == .connectedToVehicle,
+              let connection = manufacturerDataConnection else { return notStarted(.notConnected) }
+        switch connection.obdProtocol {
         case .protocol6, .protocol8:
             break
         default:
@@ -85,8 +86,10 @@ extension OBDService {
 
         let executor = OEMBatchExecutor(batch: batch)
         do {
-            return try await manufacturerDataTransport.withExclusiveCommandChannel(deadline: deadline) { channel in
-                await executor.run(on: channel, deadline: deadline, admission: admission)
+            return try await connection.transport.withExclusiveCommandChannel(deadline: deadline) { channel in
+                await executor.run(on: channel, deadline: deadline, admission: admission, isLinkCurrent: {
+                    self.vehicleLink == connection.link
+                })
             }
         } catch OEMTransportError.unsupportedTransport {
             return notStarted(.unsupportedTransport)

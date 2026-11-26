@@ -308,7 +308,8 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         vehicleLinkRecord.publish(
             OBDVehicleLink(id: UUID(), vin: info.vin, adapterID: owner.connection.peripheralID),
             adapter: owner.adapter,
-            connection: owner.connection
+            connection: owner.connection,
+            obdProtocol: info.obdProtocol
         )
     }
 
@@ -544,14 +545,32 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         }
 
         let fixedWidth = commands.filter { !Self.hasOptionalTrimByte($0) }
+        let individualTrims = commands.filter(Self.hasOptionalTrimByte).map { [$0] }
+        let groups = (fixedWidth.isEmpty ? [] : [fixedWidth]) + individualTrims
         var readings: [OBDCommand: MeasurementResult] = [:]
-        if !fixedWidth.isEmpty {
-            readings = try await requestPIDGroup(fixedWidth, unit: unit, retries: boundedRetries)
+        var anyGroupAnswered = false
+        var lastNoData: OBDServiceError?
+        for group in groups {
+            try Task.checkCancellation()
+            do {
+                let groupReadings = try await requestPIDGroup(group, unit: unit, retries: boundedRetries)
+                readings.merge(groupReadings) { _, latest in latest }
+                anyGroupAnswered = true
+            } catch let failure as OBDServiceError {
+                guard case let .commandFailed(_, underlying) = failure else { throw failure }
+                switch underlying {
+                case BLEManagerError.noData, CommunicationError.noData:
+                    lastNoData = failure
+                    continue
+                default:
+                    throw failure
+                }
+            }
         }
-        for command in commands where Self.hasOptionalTrimByte(command) {
-            let reading = try await requestPIDGroup([command], unit: unit, retries: boundedRetries)
-            readings[command] = reading[command]
-        }
+        try Task.checkCancellation()
+        // Every group said NO DATA (e.g. ignition off): report it the way a single-group
+        // poll does instead of an empty success.
+        if !anyGroupAnswered, let lastNoData { throw lastNoData }
         return readings
     }
 
@@ -584,7 +603,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// Decodes the reply to a batched Mode 01 request. Nil when no responder answered `41`.
     ///
     /// Only a positive Mode 01 response is decoded, and inside it only the PIDs it echoes
-    /// (``BatchedResponse/extractValue(_:)``): a late reply to another request that landed in
+    /// (``BatchedResponse/decode(_:)``): a late reply to another request that landed in
     /// this slot (`41 0C …` for `010D`, a `7F`, a `49 02 …`) gives no value, never a number.
     static func decodePIDResponse(
         _ response: [String],
@@ -598,14 +617,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             return nil
         }
 
-        var batchedResponse = BatchedResponse(response: responseData, unit)
-
-        let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
-            let measurement = batchedResponse.extractValue(command)
-            result[command] = measurement
-        }
-
-        return results
+        return BatchedResponse(response: responseData, unit).decode(commands)
     }
 
     /// Sends an OBD2 command to the vehicle and returns the raw response.
@@ -926,9 +938,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         elm327.commManager as? BLEManager
     }
 
-    /// The active transport, for the manufacturer-data entry point (`OBDService+OEM.swift`).
-    var manufacturerDataTransport: CommProtocol {
-        elm327.commManager
+    /// The link, protocol and transport captured together for a manufacturer batch.
+    var manufacturerDataConnection: (link: OBDVehicleLink, obdProtocol: PROTOCOL?, transport: CommProtocol)? {
+        let adapter = elm327
+        guard let entry = vehicleLinkRecord.currentEntry(adapter: adapter) else { return nil }
+        return (entry.link, entry.obdProtocol, adapter.commManager)
     }
 
     private func bindCompatibilityReporting() {
@@ -1090,7 +1104,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     private func markCompatibilityDisconnected() {
+        // Revoke under the first-write gate before the transport starts disconnecting.
+        vehicleLinkRecord.clear()
         let serviceAttempt = compatibilityAttemptFence.begin()
+        // Again after the fence: a setup that published between the two lines is revoked too.
+        vehicleLinkRecord.clear()
         guard let manager = currentBLEManager else { return }
         manager.recordDisconnected(expectDisconnectCallback: true)
         let managerAttempt = manager.currentCompatibilityAttemptToken
@@ -1257,10 +1275,11 @@ struct OBDAdapterConnectionSnapshot: Equatable, Sendable {
 ///   transport's connection: a Bluetooth teardown holds the transport's locks while it waits
 ///   for the write queue, and the write queue takes this lock to hand over a bound command.
 final class OBDVehicleLinkRecord: @unchecked Sendable {
-    private struct Entry {
+    struct Entry {
         let link: OBDVehicleLink
         let adapter: ObjectIdentifier
         let connection: OBDAdapterConnectionSnapshot
+        let obdProtocol: PROTOCOL?
     }
 
     private let lock = NSLock()
@@ -1269,17 +1288,24 @@ final class OBDVehicleLinkRecord: @unchecked Sendable {
     /// The published link, or nil once `adapter`'s transport is no longer on the connection it
     /// was published on. Never changes the record.
     func currentLink(adapter: ELM327) -> OBDVehicleLink? {
+        currentEntry(adapter: adapter)?.link
+    }
+
+    func currentEntry(adapter: ELM327) -> Entry? {
         // The entry first: whatever connection is read after it is at least as new, so a
         // mismatch means the entry expired, never that a newer entry is being judged by an
         // older connection.
         guard let current = lock.withLock({ entry }) else { return nil }
         guard current.adapter == ObjectIdentifier(adapter),
               current.connection == adapter.commManager.adapterConnection else { return nil }
-        return current.link
+        return current
     }
 
-    func publish(_ link: OBDVehicleLink, adapter: ELM327, connection: OBDAdapterConnectionSnapshot) {
-        lock.withLock { entry = Entry(link: link, adapter: ObjectIdentifier(adapter), connection: connection) }
+    func publish(_ link: OBDVehicleLink, adapter: ELM327, connection: OBDAdapterConnectionSnapshot,
+                 obdProtocol: PROTOCOL? = nil) {
+        lock.withLock {
+            entry = Entry(link: link, adapter: ObjectIdentifier(adapter), connection: connection, obdProtocol: obdProtocol)
+        }
     }
 
     func clear() {
