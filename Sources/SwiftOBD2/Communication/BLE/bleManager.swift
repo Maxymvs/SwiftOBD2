@@ -132,6 +132,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     // Focused components
     private var centralManager: CBCentralManager!
     private var messageProcessor: BLEMessageProcessor!
+    var isWireRedactionHeld: Bool { messageProcessor?.wireLog.isRedactionHeld ?? false }
     private var characteristicHandler: BLECharacteristicHandler!
     private var peripheralManager: BLEPeripheralManager!
     private var peripheralScanner: BLEPeripheralScanner!
@@ -164,8 +165,33 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         compatibilityLock.withLock { activeCompatibilityAttempt }
     }
 
+    /// The connection this transport is on now. The peripheral and the epoch that identifies
+    /// its connection come from the peripheral manager in one read under one lock; the epoch
+    /// advances there on every prepare and every reset, so a connection that was torn down never
+    /// compares equal to a later one, even to the same peripheral under the same attempt.
+    var adapterConnection: OBDAdapterConnectionSnapshot {
+        compatibilityLock.withLock {
+            let identity = peripheralManager.connectionIdentity
+            return OBDAdapterConnectionSnapshot(
+                attempt: activeCompatibilityAttempt,
+                peripheralID: identity.peripheralID,
+                epoch: identity.epoch
+            )
+        }
+    }
+
+    /// See `CommProtocol.requiresReconnect`: the stream is dirty and no probe can prove it on
+    /// this connection. Clears by itself on a reconnect, a proof, or a late probe answer.
+    var requiresReconnect: Bool {
+        OBDStreamResynchronizer.isExhausted(messageProcessor)
+    }
+
     /// Serializes all sendCommand calls — ELM327 can only handle one command at a time
     private let commandSemaphore = AsyncSemaphore(value: 1)
+
+    /// Refuses vehicle requests after a manufacturer batch couldn't restore the adapter's
+    /// addressing. Consulted in `sendCommandLocked`, so with the command mutex held.
+    let oemAddressingGate = OEMAddressingGate.shared
 
     private var cancellables = Set<AnyCancellable>()
     
@@ -259,7 +285,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         if error is CancellationError {
             failure = .cancelled
         } else if let writeError = error as? BLEWriteCoordinatorError {
-            failure = writeError == .deadlineExceeded ? .writeTimedOut : .writeFailed
+            failure = writeError.isDeadlineExpiry ? .writeTimedOut : .writeFailed
         } else if let processorError = error as? BLEMessageProcessorError {
             switch processorError {
             case .responseTimeout:
@@ -315,8 +341,15 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         if error is CancellationError {
             return .cancelled
         }
+        if let streamError = error as? OBDStreamError {
+            // No probe was answered and none is left to try: the adapter stopped answering, as
+            // far as the report is concerned (what this was before it had its own outcome).
+            // Otherwise the manufacturer channel didn't write, which says nothing about the
+            // adapter's channel.
+            return streamError == .reconnectRequired ? .adapterResponseTimedOut : nil
+        }
         if let writeError = error as? BLEWriteCoordinatorError {
-            return writeError == .deadlineExceeded ? .writeTimedOut : .writeFailed
+            return writeError.isDeadlineExpiry ? .writeTimedOut : .writeFailed
         }
         if let processorError = error as? BLEMessageProcessorError {
             switch processorError {
@@ -777,11 +810,13 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         // callback that CoreBluetooth will never send. Publish first so the
         // resolved adapter identity remains available in the failure report.
         peripheralManager.confirmedDisconnect(peripheral)
+        let failedPeripheralID = peripheral.identifier
         peripheralManager.reset()
         messageProcessor.reset()
+        releaseRedactionUnlessUnresolved(failedPeripheralID)
         requestedTeardown.clear()
         disconnectWasRequested = false
-        
+
         let oldState = connectionState
         connectionState = .error
         OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
@@ -1194,6 +1229,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             channelValidationTask = Task { [weak self] in
                 guard let self else { throw CancellationError() }
                 self.messageProcessor.reset()
+                self.applyRedactionForNewLink()
                 self.publishCompatibilityReport(
                     stage: .gattResolved,
                     subscription: .confirmed,
@@ -1219,12 +1255,44 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
         guard shouldStartKnown else { return }
         messageProcessor.reset()
+        applyRedactionForNewLink()
         publishCompatibilityReport(
             stage: .gattResolved,
             subscription: .confirmed,
             attempt: attempt
         )
         publishConnectedToAdapter(attempt: attempt)
+    }
+
+    /// Sets the wire log's redaction for the link that is starting.
+    ///
+    /// An old link's late bytes can't arrive on a new one, so normally the hold ends here. But an
+    /// adapter a manufacturer batch left unresolved keeps that configuration across the
+    /// reconnect, and until its verified recovery completes whatever it answers (to the reset,
+    /// to re-initialization) is logged without content. The hold then ends when the addressing
+    /// gate opens (`BLECommandExchange.noteAnswered`).
+    private func applyRedactionForNewLink() {
+        Self.applyRedaction(
+            forLinkTo: peripheralManager.connectedPeripheral?.identifier,
+            gate: oemAddressingGate,
+            wireLog: messageProcessor.wireLog
+        )
+    }
+
+    /// Ends the redaction hold at a link teardown, unless the adapter that link ran on is still
+    /// unresolved: its recovery hasn't happened yet, and the hold stays attached to it.
+    private func releaseRedactionUnlessUnresolved(_ peripheralID: UUID?) {
+        if let peripheralID, oemAddressingGate.isUnresolved(peripheralID) { return }
+        messageProcessor.wireLog.releaseRedaction()
+    }
+
+    /// The rule behind `applyRedactionForNewLink`, without CoreBluetooth.
+    static func applyRedaction(forLinkTo peripheralID: UUID?, gate: OEMAddressingGate, wireLog: OBDWireLog) {
+        if let peripheralID, gate.isUnresolved(peripheralID) {
+            wireLog.holdRedaction()
+        } else {
+            wireLog.releaseRedaction()
+        }
     }
 
     private func publishConnectedToAdapter(attempt: UInt64) {
@@ -1354,6 +1422,22 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// module needs longer than the default to answer, e.g. a long `19 02` DTC list after a
     /// "response pending" (`7F 19 78`).
     func sendCommand(_ command: String, retries: Int, responseTimeout: TimeInterval) async throws -> [String] {
+        try await sendCommand(command, retries: retries, responseTimeout: responseTimeout, authorization: nil)
+    }
+
+    /// See `CommProtocol.sendCommand(_:retries:authorization:)`. The check runs once the
+    /// mutex is held (so a stale binding reports itself, not a stale attempt) and again inside
+    /// every attempt's target resolution.
+    func sendCommand(_ command: String, retries: Int, authorization: OBDWriteAuthorization) async throws -> [String] {
+        try await sendCommand(command, retries: retries, responseTimeout: BLEConstants.defaultTimeout, authorization: authorization)
+    }
+
+    private func sendCommand(
+        _ command: String,
+        retries: Int,
+        responseTimeout: TimeInterval,
+        authorization: OBDWriteAuthorization?
+    ) async throws -> [String] {
         let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
         let acquired = await commandSemaphore.wait()
         guard acquired else {
@@ -1363,10 +1447,16 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
         defer { commandSemaphore.signal() }
         do {
+            try authorization?.check()
             guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
                 throw CancellationError()
             }
-            return try await sendCommandLocked(command, retries: retries, responseTimeout: responseTimeout)
+            return try await sendCommandLocked(
+                command,
+                retries: retries,
+                responseTimeout: responseTimeout,
+                authorization: authorization
+            )
         } catch {
             publishCommandFailure(error, attempt: compatibilityAttempt)
             throw error
@@ -1410,54 +1500,88 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Split out so a multi-window transaction can send and then keep listening under a single
     /// acquisition; `AsyncSemaphore` is not reentrant, so a transaction must never call
     /// `sendCommand` itself.
+    ///
+    /// Every write in this transport goes through here (`characteristicHandler.writeCommand` has
+    /// no other caller), so the addressing gate consulted inside covers telemetry, scans,
+    /// optional commands, transactions, connection setup and the manufacturer channel alike,
+    /// always for the peripheral actually being written to.
+    ///
+    /// - Parameters:
+    ///   - deadline: Absolute (`systemUptime`). Manufacturer channel only: one attempt; the
+    ///     write and the response share it. Nil keeps the ordinary timing.
+    ///   - expectedPeripheralID: When set, an attempt whose connected peripheral is a different
+    ///     one fails as a stale link instead of writing to it.
+    ///   - authorization: When set, its check runs before every attempt's write: once when the
+    ///     peripheral is resolved and again immediately before the write, after any
+    ///     resynchronization; its error ends the command with nothing (more) written.
     private func sendCommandLocked(
         _ command: String,
         retries: Int,
-        responseTimeout: TimeInterval = BLEConstants.defaultTimeout
+        responseTimeout: TimeInterval = BLEConstants.defaultTimeout,
+        deadline: TimeInterval? = nil,
+        expectedPeripheralID: UUID? = nil,
+        logPolicy: OBDWireLogPolicy = .full,
+        authorization: OBDWriteAuthorization? = nil
     ) async throws -> [String] {
-        try Task.checkCancellation()
-
-        for attempt in 1...retries {
-            try Task.checkCancellation()
-            // Validate peripheral per attempt (connection may drop between retries)
-            guard let peripheral = peripheralManager.connectedPeripheral else {
-                obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
-                throw BLEManagerError.missingPeripheralOrCharacteristic
-            }
-
-            do {
-                let token = messageProcessor.beginRequest()
-                do {
-                    try await characteristicHandler.writeCommand(command, to: peripheral)
-                } catch {
-                    // The response slot was armed before the first chunk so an
-                    // early adapter response cannot be lost. A failed/cancelled
-                    // write must invalidate that slot before any late bytes arrive.
-                    messageProcessor.reset()
-                    throw error
-                }
-                let response = try await messageProcessor.awaitResponse(for: token, timeout: responseTimeout)
-                obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
-                return response
-            } catch {
-                // Non-retryable errors — exit immediately
-                if error is CancellationError { throw error }
-                // A write coordinator error may follow one or more submitted
-                // chunks. Retrying the command would duplicate an unknown prefix.
-                if error is BLEWriteCoordinatorError { throw error }
-                if error is BLECommandEncodingError { throw error }
-                if let processorError = error as? BLEMessageProcessorError,
-                   processorError == .staleRequestToken { throw error }
-                if attempt == retries {
-                    obdError("Command failed after \(retries) attempts: \(command) - \(error.localizedDescription)", category: .communication)
-                    throw error
-                }
-                obdDebug("Attempt \(attempt)/\(retries) failed for \(command): \(error.localizedDescription), retrying...", category: .communication)
-                messageProcessor.reset()
-                try await Task.sleep(nanoseconds: UInt64(BLEConstants.retryDelay * 1_000_000_000))
-            }
+        try await commandExchange.send(
+            command,
+            retries: retries,
+            responseTimeout: responseTimeout,
+            deadline: deadline,
+            policy: logPolicy
+        ) {
+            try commandTarget(expectedPeripheralID: expectedPeripheralID, authorization: authorization)
         }
-        throw BLEManagerError.noData
+    }
+
+    /// Resolves where one attempt goes. Called per attempt (the connection may drop between
+    /// retries). The peripheral object and its write session are captured together; the write
+    /// goes out on that session or not at all, and `revalidate` (run by the exchange right
+    /// before the write, after any resynchronization) checks that both, and the request's
+    /// binding, still hold.
+    ///
+    /// A bound request's `authorization.whileAuthorized` is the command's first-write gate: the
+    /// first chunk's hand-off to CoreBluetooth runs inside the binding owner's lock, after any
+    /// wait for flow control, so a revocation either comes first (nothing written,
+    /// `BLEFirstWriteRefused`) or returns only after the hand-off. The exchange passes the gate
+    /// to the command's write only; resynchronization probes on this target are written ungated.
+    private func commandTarget(
+        expectedPeripheralID: UUID?,
+        authorization: OBDWriteAuthorization?
+    ) throws -> BLECommandExchange.Target {
+        let manager: BLEPeripheralManager = peripheralManager
+        let handler: BLECharacteristicHandler = characteristicHandler
+        guard let peripheral = manager.connectedPeripheral,
+              let session = handler.currentWriteSession(for: peripheral) else {
+            obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
+            throw BLEManagerError.missingPeripheralOrCharacteristic
+        }
+        if let expectedPeripheralID, peripheral.identifier != expectedPeripheralID {
+            throw BLEMessageProcessorError.staleRequestToken
+        }
+        try authorization?.check()
+        return BLECommandExchange.Target(
+            peripheralID: peripheral.identifier,
+            revalidate: {
+                try authorization?.check()
+                guard manager.connectedPeripheral === peripheral,
+                      handler.currentWriteSession(for: peripheral) == session else {
+                    // A bound request reports its binding; anything else, the stale link.
+                    if authorization != nil { throw OBDVehicleLinkError.linkChanged }
+                    throw BLEMessageProcessorError.staleRequestToken
+                }
+            },
+            firstWriteGate: authorization?.whileAuthorized
+        ) { command, deadlineAt, firstWriteGate in
+            // The exchange's absolute instant goes to the write as it is: no timer restarts.
+            try await handler.writeCommand(
+                command, to: peripheral, session: session, deadlineAt: deadlineAt, firstWriteGate: firstWriteGate
+            )
+        }
+    }
+
+    private var commandExchange: BLECommandExchange {
+        BLECommandExchange(processor: messageProcessor, gate: oemAddressingGate)
     }
 
 
@@ -1472,9 +1596,28 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// A window that times out (or reports `NO DATA`) ends the transaction with whatever arrived;
     /// cancellation and link loss are rethrown, so the caller can treat them as the terminal
     /// interruptions they are instead of publishing a report built on stale interim evidence.
+    /// The body is `BLECommandExchange.transaction`.
     func sendCommandTransaction(
         _ command: String,
         retries: Int,
+        shouldContinueListening: @escaping @Sendable ([String]) -> Bool,
+        listenDeadline: TimeInterval
+    ) async throws -> [String] {
+        try await sendCommandTransaction(
+            command,
+            retries: retries,
+            responseTimeout: nil,
+            shouldContinueListening: shouldContinueListening,
+            listenDeadline: listenDeadline
+        )
+    }
+
+    /// See `CommProtocol.sendCommandTransaction(_:retries:responseTimeout:shouldContinueListening:listenDeadline:)`.
+    /// `responseTimeout` is the first send's wait for its answer; nil is the default.
+    func sendCommandTransaction(
+        _ command: String,
+        retries: Int,
+        responseTimeout: TimeInterval?,
         shouldContinueListening: @escaping @Sendable ([String]) -> Bool,
         listenDeadline: TimeInterval
     ) async throws -> [String] {
@@ -1491,53 +1634,180 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
                 throw CancellationError()
             }
-            var accumulated = try await sendCommandLocked(command, retries: retries)
-            let started = Date()
-
-            while shouldContinueListening(accumulated) {
-                try Task.checkCancellation()
-                guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
-                    throw CancellationError()
+            return try await commandExchange.transaction(
+                command,
+                retries: retries,
+                responseTimeout: responseTimeout ?? BLEConstants.defaultTimeout,
+                shouldContinueListening: shouldContinueListening,
+                listenDeadline: listenDeadline,
+                checkAttempt: {
+                    guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
+                        throw CancellationError()
+                    }
+                },
+                checkLink: {
+                    guard peripheralManager.connectedPeripheral != nil else {
+                        throw BLEManagerError.peripheralNotConnected
+                    }
                 }
-                let remaining = listenDeadline - Date().timeIntervalSince(started)
-                guard remaining > 0 else {
-                    obdDebug("Extra listen budget exhausted for \(command)", category: .communication)
-                    break
-                }
-                guard peripheralManager.connectedPeripheral != nil else {
-                    throw BLEManagerError.peripheralNotConnected
-                }
-
-                let token = messageProcessor.beginContinuationRequest()
-                do {
-                    let response = try await messageProcessor.awaitResponse(
-                        for: token,
-                        timeout: min(remaining, BLEConstants.defaultTimeout)
-                    )
-                    obdDebug("Extra listen window delivered: \(response.joined(separator: " | "))", category: .communication)
-                    accumulated.append(contentsOf: response)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch let error as BLEMessageProcessorError where error == .staleRequestToken {
-                    throw error // the processor was reset under us: a disconnect, not a quiet ECU
-                } catch let error as BLEManagerError {
-                    // `NO DATA` in a listen window means nothing more came; anything else (peripheral
-                    // gone, unauthorized, …) is terminal and must never read as silence.
-                    if case .noData = error { break }
-                    throw error
-                } catch {
-                    obdDebug(
-                        "Extra listen window ended with no response: \(error.localizedDescription)",
-                        category: .communication
-                    )
-                    break
-                }
+            ) {
+                try commandTarget(expectedPeripheralID: nil, authorization: nil)
             }
-            return accumulated
         } catch {
             publishCommandFailure(error, attempt: compatibilityAttempt)
             throw error
         }
+    }
+
+    /// One acquisition of the command mutex around a whole manufacturer batch. See
+    /// `CommProtocol.withExclusiveCommandChannel`.
+    ///
+    /// `deadline` (absolute, `systemUptime`) bounds the wait for the mutex too: if it passes
+    /// first, `OEMTransportError.deadlineExpired` is thrown and `body` never runs. Cancellation
+    /// while waiting throws `CancellationError`.
+    ///
+    /// Wire logging is redacted from the moment the channel opens. It stays redacted after the
+    /// channel closes unless `body` returned normally without marking the adapter unresolved:
+    /// only then was the stream proven clean (a verified restore resynchronized it). Otherwise a
+    /// late manufacturer answer may still arrive, and the hold lasts until the addressing gate
+    /// opens after a verified recovery or the link is torn down.
+    func withExclusiveCommandChannel<T>(
+        deadline: TimeInterval,
+        _ body: @escaping (OEMCommandChannel) async throws -> T
+    ) async throws -> T {
+        try await withExclusiveCommandChannel(deadline: deadline, now: { ProcessInfo.processInfo.systemUptime }, body)
+    }
+
+    func withExclusiveCommandChannel<T>(
+        deadline: TimeInterval,
+        now: @escaping @Sendable () -> TimeInterval,
+        _ body: @escaping (OEMCommandChannel) async throws -> T
+    ) async throws -> T {
+        let compatibilityAttempt = compatibilityLock.withLock { activeCompatibilityAttempt }
+        switch await commandSemaphore.wait(until: deadline, now: now) {
+        case .acquired:
+            break
+        case .cancelled:
+            throw CancellationError()
+        case .timedOut:
+            throw OEMTransportError.deadlineExpired
+        }
+        defer { commandSemaphore.signal() }
+
+        // A newer connection attempt took over while we waited: this channel's link is gone.
+        guard isCurrentCompatibilityAttempt(compatibilityAttempt) else {
+            throw BLEMessageProcessorError.staleRequestToken
+        }
+        try Task.checkCancellation()
+        // The free-permit fast path doesn't look at the clock.
+        guard now() < deadline else {
+            throw OEMTransportError.deadlineExpired
+        }
+        // Captured once: the gate is bound to the adapter this batch runs on, whatever happens
+        // to the connection afterwards.
+        guard let peripheralID = peripheralManager.connectedPeripheral?.identifier else {
+            throw BLEManagerError.missingPeripheralOrCharacteristic
+        }
+        guard !oemAddressingGate.isUnresolved(peripheralID) else {
+            throw OEMAddressingGateError.addressingUnresolved
+        }
+
+        let wireLog = messageProcessor.wireLog
+        wireLog.holdRedaction()
+        let channel = BLEExclusiveCommandChannel(manager: self, attempt: compatibilityAttempt, peripheralID: peripheralID)
+        let result: T
+        do {
+            result = try await body(channel)
+        } catch {
+            channel.close()
+            throw error
+        }
+        channel.close()
+        // Proven clean, not assumed: a batch can end functional without ever configuring the
+        // adapter and still leave a late answer outstanding.
+        if !channel.markedUnresolved, !messageProcessor.isStreamDirty {
+            wireLog.releaseRedaction()
+        }
+        return result
+    }
+
+    /// A send on the exclusive channel, with the mutex already held by
+    /// `withExclusiveCommandChannel`. One attempt, never retransmitted; `deadline` covers write
+    /// readiness, the write's acknowledgement and the response. Like an optional command, only
+    /// terminal channel failures reach the compatibility report: a module that doesn't answer in
+    /// time says nothing about the adapter.
+    fileprivate func sendExclusiveLocked(
+        _ command: String,
+        deadline: TimeInterval,
+        attempt: UInt64,
+        peripheralID: UUID
+    ) async throws -> [String] {
+        guard isCurrentCompatibilityAttempt(attempt) else {
+            throw BLEMessageProcessorError.staleRequestToken
+        }
+        do {
+            return try await sendCommandLocked(
+                command,
+                retries: 1,
+                deadline: deadline,
+                expectedPeripheralID: peripheralID,
+                logPolicy: .redacted
+            )
+        } catch {
+            if Self.optionalCommandFailure(for: error) != nil {
+                publishCommandFailure(error, attempt: attempt)
+            }
+            throw error
+        }
+    }
+
+    /// One more prompt-terminated answer on the exclusive channel, without writing. See
+    /// `BLECommandExchange.listen`.
+    fileprivate func listenExclusiveLocked(
+        deadline: TimeInterval,
+        attempt: UInt64,
+        peripheralID: UUID
+    ) async throws -> [String] {
+        guard isCurrentCompatibilityAttempt(attempt) else {
+            throw BLEMessageProcessorError.staleRequestToken
+        }
+        guard peripheralManager.connectedPeripheral?.identifier == peripheralID else {
+            throw BLEManagerError.peripheralNotConnected
+        }
+        return try await commandExchange.listen(deadline: deadline, policy: .redacted)
+    }
+
+    /// Proves the stream in sync on the exclusive channel. See `BLECommandExchange.resynchronize`.
+    fileprivate func resynchronizeExclusiveLocked(
+        deadline: TimeInterval,
+        attempt: UInt64,
+        peripheralID: UUID
+    ) async throws -> Bool {
+        guard isCurrentCompatibilityAttempt(attempt) else {
+            throw BLEMessageProcessorError.staleRequestToken
+        }
+        guard let peripheral = peripheralManager.connectedPeripheral, peripheral.identifier == peripheralID else {
+            throw BLEManagerError.peripheralNotConnected
+        }
+        let handler: BLECharacteristicHandler = characteristicHandler
+        // Probes are bound to the write session current now, like commands.
+        guard let session = handler.currentWriteSession(for: peripheral) else {
+            throw BLEManagerError.missingPeripheralOrCharacteristic
+        }
+        let target = BLECommandExchange.Target(peripheralID: peripheralID) { command, deadlineAt in
+            try await handler.writeCommand(command, to: peripheral, session: session, deadlineAt: deadlineAt)
+        }
+        return try await commandExchange.resynchronize(deadline: deadline, policy: .redacted, target: target) == .synchronized
+    }
+
+    /// See `OEMCommandChannel.requireResynchronization`.
+    fileprivate func requireStreamResynchronization() {
+        messageProcessor.markStreamDirty()
+    }
+
+    /// Arms the addressing gate for the adapter the batch ran on.
+    fileprivate func markOEMAddressingUnresolved(peripheralID: UUID) {
+        oemAddressingGate.markUnresolved(peripheralID)
     }
 
     func scanForPeripherals() async throws {
@@ -1613,6 +1883,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
         // Reset characteristic handler with notification unsubscription
         // Pass peripheral so it can unsubscribe from notifications before clearing
+        let tornDownPeripheralID = peripheralManager.connectedPeripheral?.identifier
         if let peripheral = peripheralManager.connectedPeripheral {
             characteristicHandler.reset(peripheral: peripheral)
         } else {
@@ -1621,6 +1892,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
         // Reset message processor buffer (clears stale data)
         messageProcessor.reset()
+        releaseRedactionUnlessUnresolved(tornDownPeripheralID)
 
         // Clear discovered peripherals list
         peripheralScanner.reset()
@@ -1760,6 +2032,59 @@ extension BLEManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         willRestoreState(central, dict: dict)
+    }
+}
+
+/// The channel `BLEManager.withExclusiveCommandChannel` hands to a manufacturer batch. Valid only
+/// while that call holds the mutex: once closed, every send fails as a stale link.
+private final class BLEExclusiveCommandChannel: OEMCommandChannel {
+    private let manager: BLEManager
+    private let attempt: UInt64
+    /// The adapter the batch runs on, captured when the channel opened.
+    let peripheralID: UUID
+    private let lock = NSLock()
+    private var closed = false
+    private var unresolved = false
+
+    init(manager: BLEManager, attempt: UInt64, peripheralID: UUID) {
+        self.manager = manager
+        self.attempt = attempt
+        self.peripheralID = peripheralID
+    }
+
+    func close() {
+        lock.withLock { closed = true }
+    }
+
+    var markedUnresolved: Bool {
+        lock.withLock { unresolved }
+    }
+
+    func send(_ command: String, deadline: TimeInterval) async throws -> [String] {
+        guard !lock.withLock({ closed }) else { throw BLEMessageProcessorError.staleRequestToken }
+        return try await manager.sendExclusiveLocked(command, deadline: deadline, attempt: attempt, peripheralID: peripheralID)
+    }
+
+    func listen(deadline: TimeInterval) async throws -> [String] {
+        guard !lock.withLock({ closed }) else { throw BLEMessageProcessorError.staleRequestToken }
+        return try await manager.listenExclusiveLocked(deadline: deadline, attempt: attempt, peripheralID: peripheralID)
+    }
+
+    func resynchronize(deadline: TimeInterval) async throws -> Bool {
+        guard !lock.withLock({ closed }) else { throw BLEMessageProcessorError.staleRequestToken }
+        return try await manager.resynchronizeExclusiveLocked(deadline: deadline, attempt: attempt, peripheralID: peripheralID)
+    }
+
+    func requireResynchronization() {
+        guard !lock.withLock({ closed }) else { return }
+        manager.requireStreamResynchronization()
+    }
+
+    /// Fails closed: marks the captured adapter even if the channel was already closed or a newer
+    /// connection attempt has started meanwhile.
+    func markAddressingUnresolved() {
+        lock.withLock { unresolved = true }
+        manager.markOEMAddressingUnresolved(peripheralID: peripheralID)
     }
 }
 

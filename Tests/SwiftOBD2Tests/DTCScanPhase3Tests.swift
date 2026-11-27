@@ -408,6 +408,23 @@ final class DTCScanPhase3Tests: XCTestCase {
         XCTAssertTrue(report.isCleanForProfile, "The status read never decides cleanliness")
     }
 
+    func testAmbiguousContinuationReturnsIncompleteWithoutRetryingOrPublishingInterimCodes() async throws {
+        let comm = ScriptedComm(responses: [
+            "0101": [Self.cleanStatusLines],
+            "03": [["7E8 03 7F 03 78", "7E9 04 43 01 01 04"]],
+        ])
+        comm.continuationError = (1, OBDStreamError.ambiguousResponse)
+        let sut = makeELM327(comm: comm)
+
+        let report = try await sut.scanForTroubleCodes(profile: .storedOnly)
+
+        XCTAssertEqual(report.services[.stored], .invalidResponse)
+        XCTAssertTrue(report.observations.isEmpty)
+        XCTAssertFalse(report.isCleanForProfile)
+        XCTAssertEqual(comm.sentCommands.filter { $0 == "03" }, ["03"])
+        XCTAssertEqual(comm.additionalListens, 1)
+    }
+
     // MARK: - NRC dispositions (D15)
 
     /// §6: `7F 03 21` → re-sent up to the cap (2 extra, 3 total), then the **last NRC** is the
@@ -1063,11 +1080,15 @@ final class DTCScanPhase3Tests: XCTestCase {
         ])
         let sut = makeELM327(comm: comm)
         sut.unsupportedServiceStore = store
-        sut.vehicleIdentifier = "1N4AL3AP7DC199583"
+        // Synthetic VIN, not a real vehicle's: WMI `1N4`, VDS `SYNTH`, model year `D`, plant `0`,
+        // serial `000001`. Check digit (position 9) per ISO 3779 / 49 CFR 565: transliterated
+        // values × weights 8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2 sum to 248; 248 mod 11 = 6.
+        let syntheticVIN = "1N4SYNTH6D0000001"
+        sut.vehicleIdentifier = syntheticVIN
 
         _ = try await sut.scanForTroubleCodes(profile: .full)
 
-        let scope = DTCUnsupportedServiceKey.vin("1N4AL3AP7DC199583")
+        let scope = DTCUnsupportedServiceKey.vin(syntheticVIN)
         let permanentKey = DTCUnsupportedServiceKey(
             vehicleScope: scope,
             ecuAddress: engine,

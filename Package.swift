@@ -31,7 +31,8 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftOBD2Tests",
-            dependencies: ["SwiftOBD2"]
+            dependencies: ["SwiftOBD2"],
+            resources: [.copy("Fixtures")]
         )
     ]
 )

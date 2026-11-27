@@ -35,7 +35,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -70,7 +70,7 @@ final class BLEWriteTransportTests: XCTestCase {
             mode: .withResponse,
             session: session,
             transport: transport,
-            deadline: 3
+            deadlineAt: farFromNow()
         )
 
         XCTAssertEqual(transport.writes.map(Array.init), [
@@ -89,7 +89,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -117,7 +117,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -135,7 +135,7 @@ final class BLEWriteTransportTests: XCTestCase {
 
     func testResponseArrivingBeforeFinalWriteAckRemainsAvailableToArmedRequest() async throws {
         let processor = OBDMessageProcessor()
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
         let deadlines = ManualDeadlineScheduler()
         let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler)
         let transport = FakeWriteTransport(maximumLength: 2)
@@ -146,7 +146,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -176,7 +176,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withoutResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -208,7 +208,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withoutResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -239,7 +239,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -257,7 +257,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
         await assertThrows(retry, BLEWriteCoordinatorError.channelPoisoned)
@@ -275,7 +275,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -307,7 +307,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: session,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
 
@@ -335,7 +335,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: oldSession,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
         await waitForWrites(1, from: transport)
@@ -350,7 +350,7 @@ final class BLEWriteTransportTests: XCTestCase {
                 mode: .withResponse,
                 session: newSession,
                 transport: transport,
-                deadline: 3
+                deadlineAt: farFromNow()
             )
         }
         await waitForWrites(2, from: transport)
@@ -366,9 +366,11 @@ final class BLEWriteTransportTests: XCTestCase {
     }
 
     func testInvalidAndUnrepresentableDeadlinesFailBeforeWriting() async {
-        for deadline in [0, -.infinity, .infinity, .nan, Double.greatestFiniteMagnitude] {
+        let clock = ManualWriteClock()
+        let tooFar = clock.time + BLEWriteCoordinator.maximumSupportedDeadline + 1
+        for deadlineAt in [-.infinity, .infinity, .nan, Double.greatestFiniteMagnitude, tooFar] {
             let deadlines = ManualDeadlineScheduler()
-            let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler)
+            let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
             let transport = FakeWriteTransport(maximumLength: 20)
             let session = coordinator.activateSession()
             let task = Task {
@@ -377,12 +379,294 @@ final class BLEWriteTransportTests: XCTestCase {
                     mode: .withResponse,
                     session: session,
                     transport: transport,
-                    deadline: deadline
+                    deadlineAt: deadlineAt
                 )
             }
 
             await assertThrows(task, BLEWriteCoordinatorError.invalidDeadline)
             XCTAssertTrue(transport.writes.isEmpty)
+            XCTAssertTrue(deadlines.intervals.isEmpty)
+        }
+    }
+
+    // MARK: The absolute instant
+
+    /// An in-time write behaves exactly as before: same chunks, same order, one acknowledgement
+    /// each, and the timer armed for the time left.
+    func testInTimeWriteIsUnchanged() async throws {
+        let clock = ManualWriteClock()
+        let deadlines = ManualDeadlineScheduler()
+        let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
+        let transport = FakeWriteTransport(maximumLength: 3)
+        let session = coordinator.activateSession()
+        let task = Task {
+            try await coordinator.write(
+                Data("ABCDEFG".utf8), mode: .withResponse, session: session,
+                transport: transport, deadlineAt: clock.time + 3
+            )
+        }
+
+        for expected in 1 ... 3 {
+            await waitForWrites(expected, from: transport)
+            coordinator.didReceiveAcknowledgement(session: session, error: nil)
+        }
+        try await task.value
+        XCTAssertEqual(transport.writes.map(Array.init), [
+            Array("ABC".utf8), Array("DEF".utf8), Array("G".utf8),
+        ])
+        XCTAssertEqual(deadlines.intervals, [3])
+
+        // Not poisoned: the next command goes out normally.
+        transport.onWrite = { _, _ in coordinator.didReceiveAcknowledgement(session: session, error: nil) }
+        try await coordinator.write(
+            Data("H".utf8), mode: .withResponse, session: session,
+            transport: transport, deadlineAt: clock.time + 3
+        )
+        XCTAssertEqual(transport.writes.count, 4)
+    }
+
+    /// The executor got to the write only after the caller's instant had passed (it sat queued
+    /// behind other work). Nothing may be written, and since nothing was, the stream is intact
+    /// and the session stays usable.
+    func testWriteReachingTheExecutorAfterItsInstantWritesNothing() async throws {
+        for mode in [BLEWriteMode.withResponse, .withoutResponse] {
+            let clock = ManualWriteClock()
+            let deadlines = ManualDeadlineScheduler()
+            let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
+            let transport = FakeWriteTransport(maximumLength: 20)
+            let session = coordinator.activateSession()
+            let instant = clock.time
+            clock.time += 0.5
+
+            let late = Task {
+                try await coordinator.write(
+                    Data("22028D\r".utf8), mode: mode, session: session,
+                    transport: transport, deadlineAt: instant
+                )
+            }
+            // Nothing was handed to the transport: the "wrote nothing" flavour of the expiry.
+            await assertThrows(late, BLEWriteCoordinatorError.deadlineExceededBeforeWrite)
+            XCTAssertTrue(transport.writes.isEmpty, "\(mode)")
+            XCTAssertTrue(deadlines.intervals.isEmpty, "no timer for a write that never started: \(mode)")
+
+            transport.onWrite = { _, _ in coordinator.didReceiveAcknowledgement(session: session, error: nil) }
+            try await coordinator.write(
+                Data("0100\r".utf8), mode: mode, session: session,
+                transport: transport, deadlineAt: clock.time + 1
+            )
+            XCTAssertEqual(transport.writes.map(Array.init), [Array("0100\r".utf8)], "\(mode)")
+        }
+    }
+
+    /// Time the coordinator spends before the first physical write (here a slow MTU query) is
+    /// charged to the caller's instant: past it, the first chunk is not written.
+    func testInstantPassingBeforeTheFirstChunkWritesNothing() async throws {
+        let clock = ManualWriteClock()
+        let deadlines = ManualDeadlineScheduler()
+        let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
+        let transport = FakeWriteTransport(maximumLength: 20)
+        let entered = expectation(description: "MTU query entered")
+        let releaseQuery = transport.blockMaximumLengthQuery { entered.fulfill() }
+        let session = coordinator.activateSession()
+        transport.onWrite = { _, _ in coordinator.didReceiveAcknowledgement(session: session, error: nil) }
+        let deadlineAt = clock.time + 1
+        let task = Task {
+            try await coordinator.write(
+                Data("22028D\r".utf8), mode: .withResponse, session: session,
+                transport: transport, deadlineAt: deadlineAt
+            )
+        }
+
+        await fulfillment(of: [entered], timeout: 1)
+        clock.time = deadlineAt + 0.5
+        releaseQuery()
+        await assertThrows(task, BLEWriteCoordinatorError.deadlineExceededBeforeWrite)
+        XCTAssertTrue(transport.writes.isEmpty)
+        XCTAssertEqual(transport.writeAttempts, 0)
+
+        // Zero chunks reached the wire, so the session is not poisoned.
+        let nextTransport = FakeWriteTransport(maximumLength: 20)
+        nextTransport.onWrite = { _, _ in coordinator.didReceiveAcknowledgement(session: session, error: nil) }
+        try await coordinator.write(
+            Data("0100\r".utf8), mode: .withResponse, session: session,
+            transport: nextTransport, deadlineAt: clock.time + 1
+        )
+        XCTAssertEqual(nextTransport.writes.count, 1)
+    }
+
+    /// With response: the instant passes while the first chunk's acknowledgement is pending. The
+    /// acknowledgement must not release the next chunk, and because a prefix is on the wire the
+    /// session is poisoned.
+    func testInstantPassingBetweenAcknowledgedChunksStopsBeforeTheNextWrite() async {
+        let clock = ManualWriteClock()
+        let deadlines = ManualDeadlineScheduler()
+        let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
+        let transport = FakeWriteTransport(maximumLength: 2)
+        let session = coordinator.activateSession()
+        let deadlineAt = clock.time + 1
+        // Each chunk is acknowledged at once; the clock reaches the instant as the first one is
+        // written, so the acknowledgement arrives after it.
+        transport.onWrite = { _, _ in
+            clock.time = deadlineAt
+            coordinator.didReceiveAcknowledgement(session: session, error: nil)
+        }
+        let task = Task {
+            try await coordinator.write(
+                Data("ABCDEF".utf8), mode: .withResponse, session: session,
+                transport: transport, deadlineAt: deadlineAt
+            )
+        }
+
+        await assertThrows(task, BLEWriteCoordinatorError.deadlineExceeded)
+        transport.onWrite = { _, _ in coordinator.didReceiveAcknowledgement(session: session, error: nil) }
+
+        coordinator.didReceiveAcknowledgement(session: session, error: nil)
+        await coordinator.drainEvents()
+        XCTAssertEqual(transport.writes.map(Array.init), [Array("AB".utf8)])
+        XCTAssertEqual(transport.writeAttempts, 1)
+
+        let next = Task {
+            try await coordinator.write(
+                Data("EF".utf8), mode: .withResponse, session: session,
+                transport: transport, deadlineAt: clock.time + 1
+            )
+        }
+        await assertThrows(next, BLEWriteCoordinatorError.channelPoisoned)
+        XCTAssertEqual(transport.writes.count, 1)
+    }
+
+    /// Without response: the instant passes while waiting for flow control after the first
+    /// chunk. The ready callback must not release the next chunk.
+    func testInstantPassingBetweenFlowControlledChunksStopsBeforeTheNextWrite() async {
+        let clock = ManualWriteClock()
+        let deadlines = ManualDeadlineScheduler()
+        let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
+        let transport = FakeWriteTransport(maximumLength: 2, canSend: false)
+        transport.blockAfterEveryWrite = true
+        let session = coordinator.activateSession()
+        let deadlineAt = clock.time + 1
+        let task = Task {
+            try await coordinator.write(
+                Data("ABCDEF".utf8), mode: .withoutResponse, session: session,
+                transport: transport, deadlineAt: deadlineAt
+            )
+        }
+
+        await waitForTransportStart(transport)
+        await coordinator.drainEvents()
+        transport.canSend = true
+        coordinator.peripheralIsReady(session: session)
+        await waitForWrites(1, from: transport)
+        await coordinator.drainEvents()
+
+        // From here the peripheral would take every remaining chunk without pausing.
+        clock.time = deadlineAt + 0.01
+        transport.blockAfterEveryWrite = false
+        transport.canSend = true
+        coordinator.peripheralIsReady(session: session)
+        await assertThrows(task, BLEWriteCoordinatorError.deadlineExceeded)
+        XCTAssertEqual(transport.writes.map(Array.init), [Array("AB".utf8)])
+
+        let next = Task {
+            try await coordinator.write(
+                Data("GH".utf8), mode: .withoutResponse, session: session,
+                transport: transport, deadlineAt: clock.time + 1
+            )
+        }
+        await assertThrows(next, BLEWriteCoordinatorError.channelPoisoned)
+        XCTAssertEqual(transport.writes.count, 1)
+    }
+
+    /// The timer covers what is left of the caller's budget when it is armed, not a fresh full
+    /// interval counted from whenever the executor got round to it.
+    func testDeadlineTimerIsArmedForTheRemainingTime() async throws {
+        let clock = ManualWriteClock()
+        let deadlines = ManualDeadlineScheduler()
+        let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler, now: clock.now)
+        let transport = FakeWriteTransport(maximumLength: 20)
+        let entered = expectation(description: "MTU query entered")
+        let releaseQuery = transport.blockMaximumLengthQuery { entered.fulfill() }
+        let session = coordinator.activateSession()
+        let deadlineAt = clock.time + 3
+        let task = Task {
+            try await coordinator.write(
+                Data("ATRV\r".utf8), mode: .withResponse, session: session,
+                transport: transport, deadlineAt: deadlineAt
+            )
+        }
+
+        await fulfillment(of: [entered], timeout: 1)
+        clock.time += 2
+        releaseQuery()
+        await waitForWrites(1, from: transport)
+        XCTAssertEqual(deadlines.intervals.count, 1)
+        XCTAssertEqual(deadlines.intervals.first ?? .nan, 1, accuracy: 1e-9)
+
+        coordinator.didReceiveAcknowledgement(session: session, error: nil)
+        try await task.value
+    }
+
+    /// The deadline timer fires in both states: before any chunk reached the transport (here,
+    /// waiting for flow control) it reports "wrote nothing" and leaves the session usable; after
+    /// a chunk was submitted it reports the plain expiry and poisons the session.
+    func testTimerExpiryDistinguishesNothingWrittenFromAPrefixWritten() async throws {
+        // Zero chunks submitted.
+        do {
+            let deadlines = ManualDeadlineScheduler()
+            let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler)
+            let transport = FakeWriteTransport(maximumLength: 2, canSend: false)
+            let session = coordinator.activateSession()
+            let task = Task {
+                try await coordinator.write(
+                    Data("ATRV\r".utf8), mode: .withoutResponse, session: session,
+                    transport: transport, deadlineAt: farFromNow()
+                )
+            }
+            await waitForTransportStart(transport)
+            await coordinator.drainEvents()
+            deadlines.fireAll()
+            await assertThrows(task, BLEWriteCoordinatorError.deadlineExceededBeforeWrite)
+            XCTAssertEqual(transport.writeAttempts, 0)
+            XCTAssertTrue(BLEWriteCoordinatorError.deadlineExceededBeforeWrite.wroteNothing)
+            XCTAssertTrue(BLEWriteCoordinatorError.deadlineExceededBeforeWrite.isDeadlineExpiry)
+
+            transport.canSend = true
+            try await coordinator.write(
+                Data("ATDPN\r".utf8), mode: .withoutResponse, session: session,
+                transport: transport, deadlineAt: farFromNow()
+            )
+            XCTAssertEqual(transport.writes.count, 3, "the session was not poisoned")
+        }
+
+        // One chunk submitted.
+        do {
+            let deadlines = ManualDeadlineScheduler()
+            let coordinator = BLEWriteCoordinator(deadlineScheduler: deadlines.scheduler)
+            let transport = FakeWriteTransport(maximumLength: 2, canSend: true)
+            transport.blockAfterEveryWrite = true
+            let session = coordinator.activateSession()
+            let task = Task {
+                try await coordinator.write(
+                    Data("ATRV\r".utf8), mode: .withoutResponse, session: session,
+                    transport: transport, deadlineAt: farFromNow()
+                )
+            }
+            await waitForWrites(1, from: transport)
+            await coordinator.drainEvents()
+            deadlines.fireAll()
+            await assertThrows(task, BLEWriteCoordinatorError.deadlineExceeded)
+            XCTAssertFalse(BLEWriteCoordinatorError.deadlineExceeded.wroteNothing)
+            XCTAssertTrue(BLEWriteCoordinatorError.deadlineExceeded.isDeadlineExpiry)
+
+            transport.canSend = true
+            transport.blockAfterEveryWrite = false
+            let next = Task {
+                try await coordinator.write(
+                    Data("AT".utf8), mode: .withoutResponse, session: session,
+                    transport: transport, deadlineAt: farFromNow()
+                )
+            }
+            await assertThrows(next, BLEWriteCoordinatorError.channelPoisoned)
         }
     }
 
@@ -404,6 +688,11 @@ final class BLEWriteTransportTests: XCTestCase {
         let reached = expectation(description: "transport reached \(count) writes")
         transport.notifyWhenWriteCountReaches(count) { reached.fulfill() }
         await fulfillment(of: [reached], timeout: 1)
+    }
+
+    /// An instant no test reaches with the live clock.
+    private func farFromNow() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime + 60
     }
 
     private func waitForTransportStart(_ transport: FakeWriteTransport) async {
@@ -523,6 +812,19 @@ private final class FakeWriteTransport: BLEWriteTransport, @unchecked Sendable {
     }
 }
 
+/// A monotonic clock that only moves when the test moves it.
+private final class ManualWriteClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 100
+
+    var time: TimeInterval {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+
+    var now: @Sendable () -> TimeInterval { { [self] in time } }
+}
+
 private final class ManualDeadlineScheduler: @unchecked Sendable {
     private final class Token: BLEWriteDeadlineToken, @unchecked Sendable {
         private let lock = NSLock()
@@ -539,14 +841,21 @@ private final class ManualDeadlineScheduler: @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [Entry] = []
+    private var scheduledIntervals: [TimeInterval] = []
 
     var scheduler: BLEWriteDeadlineScheduler {
-        BLEWriteDeadlineScheduler { [weak self] _, action in
+        BLEWriteDeadlineScheduler { [weak self] interval, action in
             let token = Token()
-            self?.lock.withLock { self?.entries.append(Entry(token: token, action: action)) }
+            self?.lock.withLock {
+                self?.entries.append(Entry(token: token, action: action))
+                self?.scheduledIntervals.append(interval)
+            }
             return token
         }
     }
+
+    /// The interval each timer was armed with, in order.
+    var intervals: [TimeInterval] { lock.withLock { scheduledIntervals } }
 
     func fireAll() {
         let pending = lock.withLock { entries }

@@ -21,13 +21,13 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testAPartialFollowingResponseSurvivesTheDrain() async throws {
         let processor = OBDMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(Data("7E8 03 7F 03 78\r>\r7E8 04 43 01".utf8))
         let interim = try await processor.awaitResponse(for: first, timeout: 1)
         XCTAssertEqual(interim, ["7E8 03 7F 03 78"], "Only the interim response may be delivered")
 
         // The continuation arms over the retained prefix, then the rest of the answer lands.
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         processor.processReceivedData(Data(" 01 04\r\r>".utf8))
         let final = try await processor.awaitResponse(for: continuation, timeout: 1)
 
@@ -38,13 +38,13 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testAPartialFollowingResponseCompletedInTheGapIsDeliveredOnTheNextArm() async throws {
         let processor = OBDMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(Data("7E8 03 7F 03 78\r>\r7E8 04 43 01".utf8))
         _ = try await processor.awaitResponse(for: first, timeout: 1)
 
         processor.processReceivedData(Data(" 01 04\r\r>".utf8)) // no slot armed yet
 
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         let final = try await processor.awaitResponse(for: continuation, timeout: 1)
         XCTAssertEqual(final, ["7E8 04 43 01 01 04"])
     }
@@ -54,12 +54,12 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testTwoCompleteResponsesInOneCallbackAreDeliveredSeparately() async throws {
         let processor = OBDMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(Data("7E8 03 7F 03 78\r>\r7E8 06 43 02 01 04 05 00\r>".utf8))
         let interim = try await processor.awaitResponse(for: first, timeout: 1)
         XCTAssertEqual(interim, ["7E8 03 7F 03 78"])
 
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         let second = try await processor.awaitResponse(for: continuation, timeout: 1)
         XCTAssertEqual(second, ["7E8 06 43 02 01 04 05 00"])
     }
@@ -68,11 +68,11 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testResponsesAreDrainedOneAtATime() async throws {
         let processor = OBDMessageProcessor()
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(Data("A1\r>\rB2\r>\rC3\r>".utf8))
         let a = try await processor.awaitResponse(for: first, timeout: 1)
-        let b = try await processor.awaitResponse(for: processor.beginContinuationRequest(), timeout: 1)
-        let c = try await processor.awaitResponse(for: processor.beginContinuationRequest(), timeout: 1)
+        let b = try await processor.awaitResponse(for: try processor.beginContinuationRequest(), timeout: 1)
+        let c = try await processor.awaitResponse(for: try processor.beginContinuationRequest(), timeout: 1)
         XCTAssertEqual([a, b, c], [["A1"], ["B2"], ["C3"]])
     }
 
@@ -81,39 +81,34 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testAResponseSplitMidLineAssembles() async throws {
         let processor = OBDMessageProcessor()
 
-        let token = processor.beginRequest()
-        processor.processReceivedData(Data("7E8 10 08 43 03 01 04 05\r7E8 21 00 01".utf8))
+        let token = try processor.beginRequest()
+        processor.processReceivedData(Data("7E8 10 08 43 03 01 04 05 00\r7E8 21 00 01".utf8))
         processor.processReceivedData(Data(" 15 00 00 00\r\r>\r7E9 02".utf8))
         let lines = try await processor.awaitResponse(for: token, timeout: 1)
 
-        XCTAssertEqual(lines, ["7E8 10 08 43 03 01 04 05", "7E8 21 00 01 15 00 00 00"])
+        XCTAssertEqual(lines, ["7E8 10 08 43 03 01 04 05 00", "7E8 21 00 01 15 00 00 00"])
 
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         processor.processReceivedData(Data(" 43 00\r\r>".utf8))
         let trailing = try await processor.awaitResponse(for: continuation, timeout: 1)
         XCTAssertEqual(trailing, ["7E9 02 43 00"])
     }
 
-    /// Retention stays bounded: an unterminated flood is dropped rather than growing forever.
-    func testRetainedSuffixRespectsTheBufferBound() async {
+    /// Retention stays bounded: an unterminated flood is dropped rather than growing forever,
+    /// and the stream counts as dirty (what was dropped was part of a response).
+    func testRetainedSuffixRespectsTheBufferBound() async throws {
         let processor = OBDMessageProcessor(maxBufferSize: 64)
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(Data("7E8 02 43 00\r>".utf8))
         _ = try? await processor.awaitResponse(for: first, timeout: 1)
 
         // A long suffix with no prompt of its own: over the cap, so it must be dropped.
         processor.processReceivedData(Data(String(repeating: "7E8 02 43 00\r", count: 20).utf8))
 
-        let continuation = processor.beginContinuationRequest()
-        do {
-            let lines = try await processor.awaitResponse(for: continuation, timeout: 0.3)
-            XCTFail("An oversized retained suffix must be dropped, got \(lines)")
-        } catch {
-            XCTAssertTrue(
-                error as? OBDMessageProcessorError == .responseTimeout,
-                "Unexpected error: \(error)"
-            )
+        XCTAssertTrue(processor.isStreamDirty)
+        XCTAssertThrowsError(try processor.beginContinuationRequest()) { error in
+            XCTAssertEqual(error as? OBDStreamError, .unsynchronized)
         }
     }
 
@@ -121,11 +116,11 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testASmallRetainedSuffixIsKept() async throws {
         let processor = OBDMessageProcessor(maxBufferSize: 64)
 
-        let first = processor.beginRequest()
+        let first = try processor.beginRequest()
         processor.processReceivedData(Data("7E8 02 43 00\r>\r7E9 04 43".utf8))
         _ = try await processor.awaitResponse(for: first, timeout: 1)
 
-        let continuation = processor.beginContinuationRequest()
+        let continuation = try processor.beginContinuationRequest()
         processor.processReceivedData(Data(" 01 01 04\r\r>".utf8))
         let rest = try await processor.awaitResponse(for: continuation, timeout: 1)
         XCTAssertEqual(rest, ["7E9 04 43 01 01 04"])
@@ -143,9 +138,9 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     /// bug the call sits there for all of it and the 3 s watchdog fails; with the fix it throws at
     /// once. Racing a real timeout against task scheduling is not reproducible, so the handlers'
     /// shared entry point is driven directly.
-    func testASlotFailedBeforeItSuspendsThrowsImmediately() async {
+    func testASlotFailedBeforeItSuspendsThrowsImmediately() async throws {
         let processor = OBDMessageProcessor()
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
 
         processor.fail(token, with: OBDMessageProcessorError.responseTimeout)
 
@@ -167,9 +162,9 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     }
 
     /// A slot already suspended is still failed the same way.
-    func testASuspendedSlotIsFailedByTheSameEntryPoint() async {
+    func testASuspendedSlotIsFailedByTheSameEntryPoint() async throws {
         let processor = OBDMessageProcessor()
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
 
         let resolved = expectation(description: "the wait resolves")
         Task {
@@ -189,9 +184,9 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     }
 
     /// The same for cancellation landing before the body runs.
-    func testCancellationBeforeSuspensionStillFails() async {
+    func testCancellationBeforeSuspensionStillFails() async throws {
         let processor = OBDMessageProcessor()
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
 
         let resolved = expectation(description: "the wait resolves")
         let task = Task {
@@ -209,10 +204,10 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     }
 
     /// After such a timeout the slot is dead, not silently reusable: bytes that arrive late are
-    /// retained for the next arm instead of being handed to the abandoned request.
-    func testAResponseArrivingAfterAPreSuspensionTimeoutIsRetained() async throws {
+    /// neither handed to the abandoned request nor kept for the next one. The stream is dirty.
+    func testAResponseArrivingAfterAPreSuspensionTimeoutReachesNobody() async throws {
         let processor = OBDMessageProcessor()
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
 
         processor.fail(token, with: OBDMessageProcessorError.responseTimeout)
         let resolved = expectation(description: "the wait resolves")
@@ -223,9 +218,9 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
         await fulfillment(of: [resolved], timeout: 3)
 
         processor.processReceivedData(Data("7E8 02 43 00\r>".utf8))
-        let continuation = processor.beginContinuationRequest()
-        let lines = try await processor.awaitResponse(for: continuation, timeout: 1)
-        XCTAssertEqual(lines, ["7E8 02 43 00"])
+        XCTAssertTrue(processor.isStreamDirty)
+        XCTAssertThrowsError(try processor.beginContinuationRequest())
+        XCTAssertEqual(processor.takeLateResponses(), [["7E8 02 43 00"]], "discarded, and noted as a late answer")
     }
 
     /// Undecodable bytes inside a completed response no longer block it forever: the response is
@@ -233,7 +228,7 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
     func testGarbageBytesDoNotBlockACompletedResponse() async throws {
         let processor = OBDMessageProcessor()
 
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
         var data = Data("7E8 02 43 00\r".utf8)
         data.append(contentsOf: [0xFF, 0xFE]) // not valid UTF-8
         data.append(contentsOf: Data("\r>".utf8))
@@ -249,7 +244,7 @@ final class OBDMessageProcessorFramingTests: XCTestCase {
         let processor = OBDMessageProcessor()
         let frames = ["778037F1978", "77810FF5902FF000000"]
             + (0..<60).map { String(format: "7782%XAAAAAAAAAAAAAA", ($0 + 1) % 16) }
-        let token = processor.beginRequest()
+        let token = try processor.beginRequest()
         let text = frames.joined(separator: "\r") + "\r\r>"
         // Delivered in 20-byte notifications, like BLE.
         var offset = text.startIndex
